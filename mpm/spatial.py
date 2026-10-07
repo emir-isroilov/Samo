@@ -28,8 +28,10 @@ _MIN_PAIRS = 30            # lag oralig'ida kamida shuncha juftlik bo'lishi kera
 _MIN_LAGS_USED = 3         # variogram uchun kamida shuncha yaroqli lag
 _MAX_POINTS = 4000         # pdist xotirasini cheklash (4000 nuqta ~ 8 mln juftlik)
 _MAX_LAG_FRAC = 1.0 / 3.0  # maksimal lag = hudud diagonalining 1/3
-_STRUCT_MIN = 0.05         # nugget'dan tashqari struktura ulushi shundan kam bo'lsa - band tuzilmasiz
+_STRUCT_MIN = 0.10         # nugget'dan tashqari struktura ulushi shundan kam bo'lsa - band tuzilmasiz
 _N_RANGE_GRID = 80         # model range'ini qidirish to'ri
+_MIN_RANGE_LAGS = 2.0      # range kamida shuncha lag kengligi: qisqaroq struktura nugget'dan ajralmaydi
+_SEED_MOD = 2 ** 32        # sklearn/numpy seed chegarasi (manfiy yoki katta seed'lar ham ishlashi uchun)
 _MAX_HALVINGS = 30         # adapt_block_size: blokni ko'pi bilan shuncha marta yarmiga kamaytirish
 _MAX_ATTEMPTS = 50         # stratified_group_splits: har repeat uchun qayta urinishlar soni
 _REPORT_COLUMNS = ["repeat", "fold", "n_train", "n_val", "pos_train", "pos_val", "n_blocks_val"]
@@ -56,6 +58,12 @@ def _as_binary_labels(y, n=None):
     if y.size and not np.all((y == 0) | (y == 1)):
         raise ValueError("y faqat 0 (fon) va 1 (musbat) qiymatlardan iborat bo'lishi kerak.")
     return y.astype(np.int64)
+
+
+def _require_background(y):
+    if not np.any(y == 0):
+        raise ValueError("Fon (0) nuqtalar yo'q: faqat musbat nuqtalar bilan validatsiya (AUC) imkonsiz. "
+                         "Fon nuqtalar sonini oshiring.")
 
 
 def _check_splits_args(n_splits, n_repeats):
@@ -114,15 +122,18 @@ def _spherical(h, a):
     return 1.5 * r - 0.5 * r ** 3
 
 
-def _fit_spherical(h, g, n, max_lag):
+def _fit_spherical(h, g, n, max_lag, min_range=0.0):
     """Sferik modelni (nugget + sill*sph(h/a)) Cressie og'irliklari (n / gamma^2) bilan eng kichik
     kvadratlar usulida moslaydi. Berilgan a uchun model chiziqli (nugget, sill >= 0 -> nnls), a esa
-    to'r bo'yicha qidiriladi: konvergensiya muammosi yo'q. Qaytaradi: (a, nugget, sill_qismi) yoki None."""
+    to'r bo'yicha qidiriladi: konvergensiya muammosi yo'q. a to'ri max(h[0], min_range) dan boshlanadi:
+    birinchi lagdan qisqa range'da model ustunlari bir xil (nugget va sill ajralmaydi) va sof shovqin
+    ham 'struktura' bo'lib chiqardi. Qaytaradi: (a, nugget, sill_qismi) yoki None."""
     floor = max(0.02 * float(g.max()), 1e-12)
     sw = np.sqrt(n / np.maximum(g, floor) ** 2)
     rhs = g * sw
     best = None
-    for a in np.linspace(h[0], max_lag, _N_RANGE_GRID):
+    a_lo = min(max(float(h[0]), float(min_range)), max_lag)
+    for a in np.linspace(a_lo, max_lag, _N_RANGE_GRID):
         design = np.column_stack([np.ones_like(h), _spherical(h, a)]) * sw[:, None]
         try:
             coef, resid = nnls(design, rhs)
@@ -165,7 +176,7 @@ def _band_range(band, transform, n_lags, n_points, rng):
     h, g, n = _empirical_variogram(np.column_stack([x, y]), z, max_lag, n_lags)
     if h.size < _MIN_LAGS_USED:
         return None, "yetarli lag hosil bo'lmadi"
-    fit = _fit_spherical(h, g, n, max_lag)
+    fit = _fit_spherical(h, g, n, max_lag, min_range=_MIN_RANGE_LAGS * max_lag / n_lags)
     if fit is None:
         return None, "variogram modeli moslanmadi"
     a, nugget, psill = fit
@@ -244,7 +255,11 @@ def assign_spatial_blocks(coords, block_size):
         raise ValueError(f"Blok o'lchami musbat son bo'lishi kerak, berildi: {block_size}.")
     if coords.shape[0] == 0:
         return np.zeros(0, dtype=np.int64)
-    cell = np.floor(coords / block_size).astype(np.int64)
+    scaled = coords / block_size
+    if np.abs(scaled).max() >= 2.0 ** 62:
+        raise ValueError(f"Blok o'lchami ({block_size:g} m) koordinatalarga nisbatan juda kichik: "
+                         "blok raqamlari butun songa sig'maydi.")
+    cell = np.floor(scaled).astype(np.int64)
     _, groups = np.unique(cell, axis=0, return_inverse=True)
     return np.asarray(groups, dtype=np.int64).reshape(-1)
 
@@ -269,6 +284,7 @@ def adapt_block_size(coords, y, n_splits, block_size, min_size=10.0, log_fn=None
         raise ValueError(f"Musbat nuqtalar soni ({n_pos}) k-fold sonidan ({n_splits}) kam: har validation "
                          f"fold'ida musbat nuqta bo'lishi uchun kamida {n_splits} ta musbat nuqta kerak. "
                          "k-fold sonini kamaytiring yoki musbat nuqtalar qo'shing.")
+    _require_background(y)
     n_pos_xy = len(np.unique(coords[pos], axis=0))
     if n_pos_xy < n_splits:
         raise ValueError(f"Musbat nuqtalarning turli joylari soni ({n_pos_xy}) k-fold sonidan ({n_splits}) kam "
@@ -305,9 +321,11 @@ def stratified_group_splits(y, groups, n_splits, n_repeats, random_state=RANDOM_
     Generator: (repeat, fold, train_idx, val_idx). Har repeat'da yangi seed
     (random_state + repeat*1000 + urinish) bilan StratifiedGroupKFold(shuffle=True). Har validation
     fold'da kamida 1 musbat bo'lishi kerak: bo'lmasa boshqa seed bilan qayta uriniladi (max_attempts
-    marta); oxirida ham bo'lmasa log_fn orqali ogohlantirib, eng yaxshi bo'linish ishlatiladi.
-    Bitta blok HECH QACHON train va val orasida bo'linmaydi. Argumentlar chaqiruv paytidayoq
-    tekshiriladi: musbat nuqtali bloklar < n_splits bo'lsa aniq ValueError.
+    marta); oxirida ham bo'lmasa musbat bloki >= 2 ta fold'dan butun blok musbatsiz fold'ga ko'chiriladi
+    (musbat bloklar >= n_splits bo'lgani uchun odatda mumkin), buning ham iloji bo'lmasa log_fn orqali
+    ogohlantirib, eng yaxshi bo'linish ishlatiladi. Bitta blok HECH QACHON train va val orasida
+    bo'linmaydi. Argumentlar chaqiruv paytidayoq tekshiriladi: musbat nuqtali bloklar < n_splits yoki
+    fon nuqtalar yo'q bo'lsa aniq ValueError.
     """
     log_fn = log_fn or noop_log
     n_splits, n_repeats = _check_splits_args(n_splits, n_repeats)
@@ -323,7 +341,42 @@ def stratified_group_splits(y, groups, n_splits, n_repeats, random_state=RANDOM_
         raise ValueError(f"Musbat nuqtali bloklar soni ({n_pos_blocks}) k-fold sonidan ({n_splits}) kam: "
                          "har validation fold'ida musbat nuqta bo'lishi mumkin emas. Blok o'lchamini "
                          "kichraytiring, k-fold sonini kamaytiring yoki musbat nuqtalar qo'shing.")
+    _require_background(y)
     return _iter_group_splits(y, groups, n_splits, n_repeats, int(random_state), log_fn, max_attempts)
+
+
+def _count_no_positive(folds, y):
+    return sum(1 for _, val in folds if not np.any(y[val] == 1))
+
+
+def _repair_positive_folds(folds, y, groups):
+    """Musbatsiz validation fold'larni tuzatadi: musbat bloki >= 2 ta bo'lgan fold'dan eng kichik musbat
+    blokni BUTUNLAY musbatsiz fold'ga ko'chiradi (blok baribir bo'linmaydi). Musbat bloklar >= n_splits
+    bo'lsa har doim muvaffaqiyatli; fold'lar blok bo'yicha izchil bo'lmasa o'zgartirilmaydi."""
+    n_splits = len(folds)
+    _, gi = np.unique(groups, return_inverse=True)
+    gi = np.asarray(gi).reshape(-1)
+    label = np.full(len(y), -1, dtype=np.int64)
+    for k, (_, val) in enumerate(folds):
+        label[val] = k
+    fold_of = np.full(int(gi.max()) + 1, -1, dtype=np.int64)       # blok -> validation fold
+    fold_of[gi] = label
+    if np.any(label < 0) or not np.array_equal(fold_of[gi], label):
+        return folds
+    pos_cnt = np.bincount(gi[y == 1], minlength=fold_of.size)       # blokdagi musbatlar soni
+    is_pos = pos_cnt > 0
+    while True:
+        pos_blocks = np.bincount(fold_of[is_pos], minlength=n_splits)
+        empty = np.flatnonzero(np.bincount(fold_of, weights=pos_cnt, minlength=n_splits) == 0)
+        donors = np.flatnonzero(pos_blocks >= 2)
+        if empty.size == 0 or donors.size == 0:
+            break
+        donor = donors[np.argmax(pos_blocks[donors])]
+        cand = np.flatnonzero((fold_of == donor) & is_pos)
+        fold_of[cand[np.argmin(pos_cnt[cand])]] = empty[0]
+    label = fold_of[gi]
+    idx = np.arange(len(y))
+    return [(idx[label != k], idx[label == k]) for k in range(n_splits)]
 
 
 def _iter_group_splits(y, groups, n_splits, n_repeats, seed, log_fn, max_attempts):
@@ -332,15 +385,22 @@ def _iter_group_splits(y, groups, n_splits, n_repeats, seed, log_fn, max_attempt
         best, best_bad = None, None
         for attempt in range(max_attempts):
             sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True,
-                                        random_state=seed + repeat * 1000 + attempt)
+                                        random_state=(seed + repeat * 1000 + attempt) % _SEED_MOD)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)   # "least populated class" ogohlantirishi
                 folds = list(sgkf.split(dummy, y, groups))
-            bad = sum(1 for _, val in folds if not np.any(y[val] == 1))
+            bad = _count_no_positive(folds, y)
             if best is None or bad < best_bad:
                 best, best_bad = folds, bad
             if bad == 0:
                 break
+        if best_bad:
+            fixed = _repair_positive_folds(best, y, groups)
+            fixed_bad = _count_no_positive(fixed, y)
+            if fixed_bad < best_bad:
+                log_fn(f"  {repeat + 1}-takrorda {best_bad} ta validation fold'ida musbat nuqta yo'q edi "
+                       f"({max_attempts} urinishdan keyin): musbat bloklar fold'lar orasida qayta taqsimlandi.")
+                best, best_bad = fixed, fixed_bad
         if best_bad:
             log_fn(f"  Ogohlantirish: {repeat + 1}-takrorda {best_bad} ta validation fold'ida musbat nuqta "
                    f"yo'q ({max_attempts} urinishdan keyin); eng yaxshi bo'linish ishlatildi.")
@@ -362,7 +422,7 @@ def random_stratified_splits(y, n_splits, n_repeats, random_state=RANDOM_STATE):
 
 
 def _iter_random_splits(y, n_splits, n_repeats, seed):
-    rskf = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=seed)
+    rskf = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=seed % _SEED_MOD)
     for i, (train_idx, val_idx) in enumerate(rskf.split(np.zeros(len(y)), y)):
         yield i // n_splits, i % n_splits, train_idx, val_idx
 
@@ -387,7 +447,7 @@ def _iter_bootstrap(groups, n_boot, seed):
     order = np.argsort(groups, kind="stable")
     _, starts, counts = np.unique(groups[order], return_index=True, return_counts=True)
     n_blocks = len(starts)
-    rng = np.random.default_rng(abs(seed))
+    rng = np.random.default_rng(seed % _SEED_MOD)
     for _ in range(n_boot):
         chosen = rng.integers(0, n_blocks, size=n_blocks)
         lens = counts[chosen]
@@ -419,4 +479,4 @@ def fold_report(y, coords, groups, splits):
             "pos_train": int(np.sum(y[train_idx] == 1)), "pos_val": int(np.sum(y[val_idx] == 1)),
             "n_blocks_val": int(np.unique(groups[val_idx]).size) if groups is not None else int(val_idx.size),
         })
-    return pd.DataFrame(rows, columns=_REPORT_COLUMNS)
+    return pd.DataFrame(rows, columns=_REPORT_COLUMNS).astype("int64")

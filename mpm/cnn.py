@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 
 import numpy as np
 from sklearn.model_selection import train_test_split
@@ -32,7 +33,9 @@ META_FORMAT = 1
 MODEL_FILE = "model.keras"
 META_FILE = "meta.json"
 _STAT_CHUNK = 4096            # statistika hisoblash uchun qatorlar bo'yicha chunk
+_CONST_REL = 1e-7             # std <= _CONST_REL * |mean| bo'lsa kanal o'zgarmas (float32 yaxlitlash shovqini)
 _PREDICT_ELEMS = 2 ** 25      # predict chunk'ining taxminiy element soni (~128 MB float32)
+_BUILD_LOCK = threading.Lock()   # clear_session + seed + qurish: global Keras/random holati oqimlararo bo'lishmasin
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +158,9 @@ def build_keras_model(params, n_channels, keras=None):
 # ---------------------------------------------------------------------------
 def _channel_stats(arr):
     """Oxirgi o'q (kanal) bo'yicha mean/std, faqat chekli qiymatlardan (nanmean/nanstd, ddof=0).
-    Kanalda chekli qiymat yo'q yoki std < 1e-8 bo'lsa std=1 (mean=0 agar qiymat yo'q)."""
+    Kanal o'zgarmas (std=0 yoki o'rtachaga nisbatan float32 yaxlitlash shovqini darajasida) yoki chekli qiymat
+    yo'q bo'lsa std=1 (mean=0 agar qiymat yo'q). Mutlaq chegara YO'Q: kichik birlikdagi qatlamlar (Tesla, 1/s^2)
+    ham to'g'ri standartlanadi."""
     n_ch = arr.shape[-1]
     axes = tuple(range(arr.ndim - 1))
     cnt = np.zeros(n_ch)
@@ -172,8 +177,10 @@ def _channel_stats(arr):
         ok = np.isfinite(a)
         sq += np.where(ok, (a - mean) ** 2, 0.0).sum(axis=axes)
     std = np.sqrt(np.divide(sq, cnt, out=np.zeros(n_ch), where=cnt > 0))
-    std[~np.isfinite(std) | (std < 1e-8)] = 1.0
-    return mean.astype(np.float32), std.astype(np.float32)
+    std[~np.isfinite(std) | (std <= _CONST_REL * np.abs(mean))] = 1.0
+    mean32, std32 = mean.astype(np.float32), std.astype(np.float32)
+    std32[std32 == 0] = 1.0                # float32 ga o'tganda yo'qolib ketgan (denormal) std
+    return mean32, std32
 
 
 def _standardize(arr, mean, std):
@@ -281,8 +288,8 @@ def _keras_classes(keras):
 
 
 def _clear_session(keras):
-    """Keras global holatini (nom hisoblagichlari, grafik keshlari) tozalaydi. Allaqachon o'qitilgan
-    modellar bashorati ta'sirlanmaydi (tekshirilgan), lekin xatolik o'qitishni to'xtatmasin."""
+    """Keras global holatini (nom hisoblagichlari, grafik keshlari, oldingi modellar chiqindisi) tozalaydi.
+    Allaqachon o'qitilgan modellar bashorati ta'sirlanmaydi (tekshirilgan); xatolik o'qitishni to'xtatmasin."""
     try:
         keras.backend.clear_session()
     except Exception:
@@ -295,7 +302,7 @@ def _clear_session(keras):
 class CNNModel(ModelWrapper):
     """Patch-CNN (input_kind="patch") yoki 1D-CNN (input_kind="tabular").
 
-    n_jobs saqlanadi, lekin TensorFlow o'z oqimlarini o'zi boshqaradi (jarayon boshida o'rnatiladi)."""
+    n_jobs faqat saqlanadi (meta.json'ga yoziladi): TensorFlow o'z oqimlarini o'zi boshqaradi, n_jobs ta'sir qilmaydi."""
     name = "CNN"
 
     def __init__(self, params, seed=RANDOM_STATE, n_jobs=1):
@@ -398,25 +405,25 @@ class CNNModel(ModelWrapper):
         has_val = va is not None
         monitor = "val_loss" if has_val else "loss"
 
-        _clear_session(keras)
-        keras.utils.set_random_seed(self._seed32)
-        model = None
-        try:
-            n_ch = arr.shape[-1]
-            model = build_keras_model(p, n_ch, keras=keras)
-            cls = _keras_classes(keras)
-            source = _BatchSource(Z[tr], yf[tr], sw[tr], p["batch_size"], self._seed32,
-                                  augment=p["augment"] and p["mode"] == "patch2d")
-            seq = cls["TrainSequence"](source)
-            callbacks = [cls["EpochSync"](seq), cls["CancelCallback"](cancel),
-                         keras.callbacks.EarlyStopping(monitor=monitor, patience=p["patience"],
-                                                       restore_best_weights=True)]
-            val_data = (Z[va], yf[va], sw[va]) if has_val else None
-            hist = model.fit(seq, validation_data=val_data, epochs=p["epochs"], shuffle=False, verbose=0,
-                             callbacks=callbacks).history
-            check_cancel(cancel)
-        finally:
+        # clear_session keyingi modelni qurishdan OLDIN (o'qitilgan modellar bashorati buzilmaydi - tekshirilgan),
+        # keyin seed: clear_session global seed generatorini qayta tiklaydi. Qulf: parallel oqimlarda (joblib
+        # threading) qatlam nomlari to'qnashmasin va boshlang'ich vaznlar/dropout faqat o'z seed'iga bog'liq bo'lsin.
+        n_ch = arr.shape[-1]
+        with _BUILD_LOCK:
             _clear_session(keras)
+            keras.utils.set_random_seed(self._seed32)
+            model = build_keras_model(p, n_ch, keras=keras)
+        cls = _keras_classes(keras)
+        source = _BatchSource(Z[tr], yf[tr], sw[tr], p["batch_size"], self._seed32,
+                              augment=p["augment"] and p["mode"] == "patch2d")
+        seq = cls["TrainSequence"](source)
+        callbacks = [cls["EpochSync"](seq), cls["CancelCallback"](cancel),
+                     keras.callbacks.EarlyStopping(monitor=monitor, patience=p["patience"],
+                                                   restore_best_weights=True)]
+        val_data = (Z[va], yf[va], sw[va]) if has_val else None
+        hist = model.fit(seq, validation_data=val_data, epochs=p["epochs"], shuffle=False, verbose=0,
+                         callbacks=callbacks).history
+        check_cancel(cancel)
 
         curve = np.asarray(hist[monitor], dtype=float)
         if not np.isfinite(curve).any():

@@ -40,6 +40,7 @@ _PATCH_CHUNK_ELEMS = 8_000_000   # extract_patches: bir chunk'dagi maks. element
 _MAX_BATCH = 2_000_000       # fon nomzodlari: bir batch maks. hajmi
 _GRID_JITTER = 0.8           # grid strategiyasida katak ichidagi og'ish (katak ulushi)
 _VIF_RIDGE = 1e-8
+_CONST_RTOL = 1e-12          # std <= bu * |mean| bo'lsa band o'zgarmas deb hisoblanadi
 
 
 # ---------------------------------------------------------------------------
@@ -91,10 +92,11 @@ def _names_list(names):
 
 
 def _list_files(folder, suffixes):
+    """Yashirin fayllar (masalan macOS '._x.tif') o'tkazib yuboriladi - asl koddagi glob ham ularni olmagan."""
     if not folder or not os.path.isdir(folder):
         return []
     names = [n for n in os.listdir(folder)
-             if n.lower().endswith(suffixes) and os.path.isfile(os.path.join(folder, n))]
+             if not n.startswith(".") and n.lower().endswith(suffixes) and os.path.isfile(os.path.join(folder, n))]
     return [os.path.join(folder, n) for n in sorted(names, key=lambda s: (s.lower(), s))]
 
 
@@ -164,7 +166,7 @@ def _read_band(path):
     """Faylni BIR marta ochadi: 1-band (nodata/inf/|x|>1e15 -> NaN, float32) va manba ma'lumotlari."""
     with rasterio.open(path) as src:
         info = {"crs": src.crs, "transform": src.transform, "width": src.width, "height": src.height,
-                "bounds": tuple(src.bounds), "nodata": src.nodata, "dtype": src.dtypes[0]}
+                "bounds": tuple(src.bounds), "nodata": src.nodata, "dtype": src.dtypes[0], "count": src.count}
         masked = src.read(1, masked=True)
     with np.errstate(over="ignore", invalid="ignore"):
         arr = np.ma.filled(masked.astype(np.float32), np.nan)
@@ -242,6 +244,8 @@ def load_and_align_rasters(tiff_paths, categorical=(), log_fn=None, assume_crs_i
         if info["transform"].is_identity:
             raise ValueError(f"'{os.path.basename(path)}' georeferenslanmagan (transform yo'q).")
         crs = _resolve_crs(info["crs"], path, assume_crs_if_missing, fallback_epsg, log)
+        if info["count"] > 1:
+            log(f"  OGOHLANTIRISH: '{os.path.basename(path)}' faylida {info['count']} ta band bor; faqat 1-band ishlatiladi.")
         if i == 0:
             if _is_target_crs(crs):
                 ref_transform, height, width = info["transform"], info["height"], info["width"]
@@ -610,13 +614,22 @@ def _to_target_crs(gdf, name, assume_crs_if_missing, log):
     return gdf
 
 
+def _in_target_crs(gdf):
+    """CRS berilgan va EPSG:28411 dan farq qilsa, 28411 ga o'tkazadi (CRS yo'q => 28411 deb olinadi)."""
+    if gdf is not None and gdf.crs is not None and gdf.crs.to_epsg() != TARGET_EPSG:
+        return gdf.to_crs(epsg=TARGET_EPSG)
+    return gdf
+
+
 def _aoi_geometry(aoi_gdf):
-    """AOI GeoDataFrame -> tuzatilgan va prepared birlashma geometriyasi (EPSG:28411 deb olinadi)."""
+    """AOI GeoDataFrame -> tuzatilgan va prepared birlashma geometriyasi (EPSG:28411 deb olinadi).
+    Noto'g'ri geometriyalar birlashtirishdan oldin tuzatiladi (aks holda union TopologyException berishi mumkin)."""
     if aoi_gdf is None or len(aoi_gdf) == 0:
         raise ValueError("AOI bo'sh.")
-    if aoi_gdf.crs is not None and aoi_gdf.crs.to_epsg() != TARGET_EPSG:
-        aoi_gdf = aoi_gdf.to_crs(epsg=TARGET_EPSG)
-    return _prepare(_fix_polygon(_union_all(aoi_gdf)))
+    geoms = [_fix_polygon(g) for g in _in_target_crs(aoi_gdf).geometry if g is not None and not g.is_empty]
+    if not geoms:
+        raise ValueError("AOI geometriyasi bo'sh.")
+    return _prepare(_fix_polygon(_union_all(gpd.GeoSeries(geoms))))
 
 
 def load_aoi(aoi_shp, assume_crs_if_missing=True, log_fn=None):
@@ -803,7 +816,10 @@ def _bg_grid(sampler, rng, n_points, max_cells):
     for _ in range(60):
         nx, ny = int(np.ceil(w / cell)), int(np.ceil(h / cell))
         if nx * ny > max_cells:
-            break
+            if attempts:
+                break
+            cell *= np.sqrt(nx * ny / max_cells) * 1.01     # birinchi to'r juda zich (ingichka AOI): hajmni cheklaymiz
+            continue
         gx, gy = np.meshgrid(minx + (np.arange(nx) + 0.5) * cell, miny + (np.arange(ny) + 0.5) * cell)
         jx = (rng.random(gx.size) - 0.5) * cell * _GRID_JITTER
         jy = (rng.random(gy.size) - 0.5) * cell * _GRID_JITTER
@@ -847,6 +863,7 @@ def generate_background_points(aoi_gdf, positive_gdf, n_points, min_distance, ra
             raise ValueError(f"valid_mask 2 o'lchamli (H, W) bo'lishi kerak, berilgan: {valid_mask.shape}")
 
     rng = np.random.default_rng(random_state)
+    positive_gdf = _in_target_crs(positive_gdf)
     pos_xy = _gdf_xy(positive_gdf) if positive_gdf is not None and len(positive_gdf) else np.empty((0, 2))
     sampler = _BgSampler(_aoi_geometry(aoi_gdf), pos_xy, min_distance, valid_mask, transform)
     max_attempts = max(int(n_points * max_attempts_factor), 1000)
@@ -871,7 +888,7 @@ def generate_background_points(aoi_gdf, positive_gdf, n_points, min_distance, ra
             f"min_distance ni kamaytiring yoki AOI/valid_mask ni tekshiring.")
     else:
         log(f"  Fon nuqtalar ({strategy}): {x.size} ta ({attempts} urinish).")
-    return gpd.GeoDataFrame(geometry=gpd.points_from_xy(x, y), crs=aoi_gdf.crs)
+    return gpd.GeoDataFrame(geometry=gpd.points_from_xy(x, y), crs=_in_target_crs(aoi_gdf).crs)
 
 
 # ---------------------------------------------------------------------------
@@ -904,6 +921,8 @@ def extract_patches(feature_stack, rows, cols, window):
     fs = np.asarray(feature_stack)
     if fs.ndim != 3:
         raise ValueError(f"feature_stack 3 o'lchamli (p, H, W) bo'lishi kerak, berilgan: {fs.shape}")
+    if not np.issubdtype(fs.dtype, np.floating):
+        fs = fs.astype(np.float32)          # NaN bilan to'ldirish uchun
     window = int(window)
     if window < 1 or window % 2 == 0:
         raise ValueError(f"Oyna o'lchami toq musbat son bo'lishi kerak: {window}")
@@ -1028,6 +1047,10 @@ def _feature_effects(dataset):
     X = dataset.X.astype(np.float64)
     pos = dataset.y == 1
     n1, n0 = int(pos.sum()), int((~pos).sum())
+    if n1 == 0 or n0 == 0:      # bir sinfli qism: farq hisoblanmaydi
+        nan = np.full(X.shape[1], np.nan)
+        return pd.DataFrame({"feature": dataset.feature_names, "mean_pos": nan, "mean_neg": nan,
+                             "cohen_d": nan, "auc": nan})
     mp, mn = X[pos].mean(axis=0), X[~pos].mean(axis=0)
     d = np.full(X.shape[1], np.nan)
     if n1 > 1 and n0 > 1:
@@ -1083,18 +1106,21 @@ def data_diagnostics(raster, dataset=None, max_pixels=50000, seed=RANDOM_STATE):
     corr = np.full((len(names), len(names)), np.nan)
     const = np.ones(len(names), dtype=bool)
     if k >= 2:
-        std = sample.std(axis=0)
-        const = std < 1e-12
-        z = (sample - sample.mean(axis=0)) / np.where(const, 1.0, std)
+        mean, std = sample.mean(axis=0), sample.std(axis=0)
+        const = std <= _CONST_RTOL * np.abs(mean)       # nisbiy: qatlam masshtabiga bog'liq emas
+        z = (sample - mean) / np.where(const, 1.0, std)
         corr = np.clip(z.T @ z / k, -1.0, 1.0)
         corr[const, :] = np.nan
         corr[:, const] = np.nan
         np.fill_diagonal(corr, np.where(const, np.nan, 1.0))
     ok = ~const
+    enough = k >= 2 and k > int(ok.sum())        # k <= band soni => korrelyatsiya matritsasi singular
     vif = np.full(len(names), np.nan)
-    if ok.any():
+    if ok.any() and enough:
         vif[ok] = _vif_from_corr(corr[np.ix_(ok, ok)])
-    flags = [_vif_flag(v) for v in vif] if k >= 2 else ["ma'lumot yetarli emas"] * len(names)
+    little = "ma'lumot yetarli emas"
+    flags = [little if k < 2 else ("o'zgarmas" if c else (_vif_flag(v) if enough else little))
+             for v, c in zip(vif, const)]
     vif_df = pd.DataFrame({"band": names, "vif": vif, "flag": flags}, columns=["band", "vif", "flag"])
 
     pairs = []

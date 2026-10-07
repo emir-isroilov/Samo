@@ -79,6 +79,14 @@ def test_assign_blocks_validation():
     assert spatial.assign_spatial_blocks(np.zeros((0, 2)), 100.0).size == 0
 
 
+def test_assign_blocks_tiny_block_overflow_raises():
+    # blok raqamlari int64 ga sig'maydi: jim-jit axlat guruhlar o'rniga aniq xato
+    coords, _ = _points()
+    with pytest.raises(ValueError, match="juda kichik"):
+        spatial.assign_spatial_blocks(coords, 1e-15)
+    assert spatial.assign_spatial_blocks(coords, 1e-3).max() > 0
+
+
 # ---------------------------------------------------------------------------
 # adapt_block_size
 # ---------------------------------------------------------------------------
@@ -135,6 +143,12 @@ def test_adapt_block_size_impossible():
         spatial.adapt_block_size(coords, y, 1, 1000.0)
     with pytest.raises(ValueError, match="y"):
         spatial.adapt_block_size(coords, y[:-1], 5, 1000.0)
+
+
+def test_adapt_block_size_requires_background():
+    coords, _ = _points()
+    with pytest.raises(ValueError, match="Fon"):
+        spatial.adapt_block_size(coords, np.ones(len(coords), dtype=np.int8), 5, 1000.0)
 
 
 def test_adapt_block_size_max_halvings():
@@ -244,6 +258,131 @@ def test_too_few_blocks_and_bad_args():
         spatial.stratified_group_splits(y, groups, 5, 0)
     with pytest.raises(ValueError, match="0 .*1"):
         spatial.stratified_group_splits(np.full(len(y), 2), groups, 5, 1)
+
+
+def test_group_splits_single_class_raises():
+    coords, y, groups = _split_data()
+    with pytest.raises(ValueError, match="Fon"):
+        spatial.stratified_group_splits(np.ones(len(y)), groups, 5, 1)       # fon yo'q
+    with pytest.raises(ValueError, match="Musbat"):
+        spatial.stratified_group_splits(np.zeros(len(y)), groups, 5, 1)      # musbat yo'q
+
+
+@pytest.mark.parametrize("seed", [-1, -12345, 2 ** 32, 2 ** 32 - 1, 2 ** 40 + 7])
+def test_extreme_seeds_are_accepted_and_deterministic(seed):
+    # manfiy / 2**32 dan katta seed sklearn'da ValueError berardi
+    coords, y, groups = _split_data()
+    a = list(spatial.stratified_group_splits(y, groups, 5, 2, random_state=seed))
+    b = list(spatial.stratified_group_splits(y, groups, 5, 2, random_state=seed))
+    assert len(a) == 10 and all(np.array_equal(x[3], z[3]) for x, z in zip(a, b))
+    ra = list(spatial.random_stratified_splits(y, 5, 2, random_state=seed))
+    rb = list(spatial.random_stratified_splits(y, 5, 2, random_state=seed))
+    assert len(ra) == 10 and all(np.array_equal(x[3], z[3]) for x, z in zip(ra, rb))
+    ba = list(spatial.block_bootstrap_indices(groups, 3, random_state=seed))
+    bb = list(spatial.block_bootstrap_indices(groups, 3, random_state=seed))
+    assert len(ba) == 3 and all(np.array_equal(x, z) for x, z in zip(ba, bb))
+
+
+def _blocks_from_sizes(pos_sizes, extra_neg, neg_sizes):
+    """Blok darajasida sintetik guruhlar: har musbat blokda pos_sizes[i] musbat + extra_neg fon,
+    so'ng faqat fonli bloklar."""
+    groups, y = [], []
+    for gid, size in enumerate(pos_sizes):
+        groups += [gid] * (size + extra_neg)
+        y += [1] * size + [0] * extra_neg
+    for j, size in enumerate(neg_sizes):
+        groups += [len(pos_sizes) + j] * size
+        y += [0] * size
+    return np.array(groups), np.array(y)
+
+
+@pytest.mark.parametrize("n_splits,pos_sizes,extra_neg,neg_sizes", [
+    (5, [8, 4, 1, 1, 1, 1], 2, [10, 10]),
+    (10, [12, 6, 5, 3, 2, 2, 1, 1, 1, 1], 1, [5] * 6),
+])
+def test_val_folds_have_positive_when_positives_clustered_in_few_blocks(n_splits, pos_sizes, extra_neg,
+                                                                        neg_sizes):
+    # StratifiedGroupKFold bunda 50 urinishdan keyin ham musbatsiz val fold beradi (musbatlar bir necha
+    # katta blokda to'plangan, musbat bloklar ~ n_splits); musbat bloklar >= n_splits bo'lgani uchun
+    # butun blokni ko'chirish bilan har fold'ga musbat berish mumkin (BUG-05)
+    groups, y = _blocks_from_sizes(pos_sizes, extra_neg, neg_sizes)
+    assert np.unique(groups[y == 1]).size >= n_splits
+    n = len(y)
+    splits = list(spatial.stratified_group_splits(y, groups, n_splits, 3, random_state=42))
+    assert len(splits) == 3 * n_splits
+    for repeat in range(3):
+        vals = []
+        for r, fold, tr, va in splits:
+            if r != repeat:
+                continue
+            assert y[va].sum() >= 1 and y[tr].sum() >= 1
+            assert not (_val_groups(groups, va) & _val_groups(groups, tr))   # blok bo'linmagan
+            assert np.array_equal(np.sort(np.r_[tr, va]), np.arange(n))
+            vals.append(va)
+        assert np.array_equal(np.sort(np.concatenate(vals)), np.arange(n))
+
+
+def _fake_group_sgkf():
+    """Blok bo'yicha izchil, lekin 0-fold'ga faqat musbatsiz bloklarni beradigan soxta SGKF."""
+    class Fake:
+        calls = []
+
+        def __init__(self, n_splits, shuffle=False, random_state=None):
+            self.n_splits = n_splits
+            Fake.calls.append(random_state)
+
+        def split(self, X, y, groups):
+            _, inv = np.unique(groups, return_inverse=True)
+            inv = np.asarray(inv).reshape(-1)
+            pos_block = np.zeros(inv.max() + 1, dtype=bool)
+            pos_block[inv[y == 1]] = True
+            fold_of = np.zeros(pos_block.size, dtype=np.int64)
+            fold_of[pos_block] = 1 + np.arange(int(pos_block.sum())) % (self.n_splits - 1)
+            label = fold_of[inv]
+            idx = np.arange(len(y))
+            return [(idx[label != k], idx[label == k]) for k in range(self.n_splits)]
+    return Fake
+
+
+def test_repair_moves_whole_positive_block_after_retries_exhausted(monkeypatch):
+    coords, y, groups = _split_data()
+    fake = _fake_group_sgkf()
+    monkeypatch.setattr(spatial, "StratifiedGroupKFold", fake)
+    msgs = []
+    splits = list(spatial.stratified_group_splits(y, groups, 5, 2, random_state=0, log_fn=msgs.append,
+                                                  max_attempts=4))
+    assert len(fake.calls) == 8                                     # har repeat uchun 4 urinish (hammasi yomon)
+    assert len(msgs) == 2 and all("qayta taqsimlandi" in m for m in msgs)
+    assert not any("Ogohlantirish" in m for m in msgs)              # tuzatildi: ogohlantirish kerak emas
+    assert len(splits) == 10
+    for r in range(2):
+        vals = [va for rr, _, _, va in splits if rr == r]
+        assert np.array_equal(np.sort(np.concatenate(vals)), np.arange(len(y)))
+    for _, _, tr, va in splits:
+        assert y[va].sum() >= 1
+        assert not (_val_groups(groups, va) & _val_groups(groups, tr))
+
+
+def test_repair_positive_folds_unit():
+    #            A  A  B  C  D       (A: 2 musbat, B: 1, C: 1, D: fon)
+    groups = np.array([0, 0, 1, 2, 3])
+    y = np.array([1, 1, 1, 1, 0])
+    idx = np.arange(5)
+    # 0-fold: A,B,C; 1-fold: D (musbatsiz); 2-fold: bo'sh
+    folds = [(idx[[4]], idx[[0, 1, 2, 3]]), (idx[[0, 1, 2, 3]], idx[[4]]), (idx, idx[:0])]
+    fixed = spatial._repair_positive_folds(folds, y, groups)
+    # donor 0-fold'dan eng kichik musbat bloklar (B, keyin C) butunlay ko'chadi
+    assert [va.tolist() for _, va in fixed] == [[0, 1], [2, 4], [3]]
+    for tr, va in fixed:
+        assert y[va].sum() >= 1 and not (set(groups[tr]) & set(groups[va]))
+        assert np.array_equal(np.sort(np.r_[tr, va]), idx)
+    # blok bo'yicha izchil bo'lmagan fold'lar (A bloki 0- va 1-fold'ga bo'lingan) o'zgartirilmaydi
+    split_block = [(idx[[1, 2, 3, 4]], idx[[0]]), (idx[[0, 2, 3, 4]], idx[[1]]),
+                   (idx[[0, 1, 4]], idx[[2, 3]])]
+    assert spatial._repair_positive_folds(split_block, y, groups) is split_block
+    # tuzatish kerak bo'lmasa fold'lar bir xil qoladi
+    ok = [(idx[[2, 3, 4]], idx[[0, 1]]), (idx[[0, 1, 3, 4]], idx[[2]]), (idx[[0, 1, 2]], idx[[3, 4]])]
+    assert [va.tolist() for _, va in spatial._repair_positive_folds(ok, y, groups)] == [[0, 1], [2], [3, 4]]
 
 
 def _fake_sgkf(good_from):
@@ -396,6 +535,7 @@ def test_fold_report():
     rnd = spatial.fold_report(y, None, None, spatial.random_stratified_splits(y, 5, 1))
     assert (rnd["n_blocks_val"] == rnd["n_val"]).all()
     assert spatial.fold_report(y, coords, groups, []).empty
+    assert (spatial.fold_report(y, coords, groups, []).dtypes == "int64").all()     # bo'sh jadval ham int64
     with pytest.raises(ValueError, match="coords"):
         spatial.fold_report(y, coords[:-1], groups, splits)
 
@@ -475,6 +615,24 @@ def test_variogram_none_cases():
     few[0, :5, :5] = np.random.default_rng(0).normal(size=(5, 5))
     assert spatial.estimate_autocorrelation_range(few, tr) is None                        # <50 valid piksel
     assert spatial.estimate_autocorrelation_range(_smooth_band(6)[None], tr, band_indices=[]) is None
+
+
+def test_variogram_white_noise_not_reported_as_structure_for_many_seeds():
+    # eski kodda sof shovqinning ~25% i 'struktura' deb chiqardi (range = birinchi lag yoki max_lag)
+    tr = _transform()
+    spurious = [s for s in range(20)
+                if spatial.estimate_autocorrelation_range(
+                    np.random.default_rng(s).normal(size=(1, 120, 120)).astype("float32"), tr,
+                    random_state=s) is not None]
+    assert spurious == []
+
+
+def test_fit_spherical_flat_variogram_has_no_structure():
+    # birinchi lagdan qisqa range'da model ustunlari bir xil: nugget/sill ajralmaydi, yassi variogram
+    # 'struktura' bo'lib chiqmasligi kerak
+    h = np.linspace(100.0, 1500.0, 12)
+    a, nugget, psill = spatial._fit_spherical(h, np.ones(12), np.full(12, 500), 1600.0, min_range=300.0)
+    assert a >= 300.0 and psill / (nugget + psill) < spatial._STRUCT_MIN
 
 
 def test_variogram_nan_inf_robust():

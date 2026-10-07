@@ -32,6 +32,7 @@ from .config import MODEL_NAMES, PARAM_SPECS
 
 SKLEARN_MODELS = ("RandomForest", "SVM", "XGBoost")
 CALIBRATION_METHODS = ("sigmoid", "isotonic")
+_SCAN_ROWS = 1 << 16        # NaN/inf tekshiruvi bo'lagi (qatorlar)
 
 
 # ---------------------------------------------------------------------------
@@ -202,20 +203,34 @@ class SklearnModel(ModelWrapper):
         self.n_features_ = None
         self.model_ = None
 
+    @property
+    def _rs(self):
+        """sklearn/xgboost random_state uchun 0..2**32-2 oralig'idagi seed (CNN bilan bir xil qoida):
+        katta yoki manfiy seed RF'ni yiqitmasin."""
+        return self.seed % (2 ** 32 - 1)
+
     # ---- kirishni tekshirish
-    def _check_X(self, X):
+    def _check_X(self, X, fitting=False):
+        """X ni (n, p) raqamli massivga keltiradi (dtype saqlanadi, nusxa yo'q) va NaN/inf ni tekshiradi.
+        fitting=True: faqat e'lon qilingan n_features bilan solishtiriladi (qayta fit boshqa p bilan mumkin)."""
         if X is None:
             raise ValueError(f"{self.name}: X berilmagan (tabular model X (n, n_features) talab qiladi).")
         try:
-            X = np.asarray(X, dtype=np.float64)
+            X = np.asarray(X)
+            if X.dtype.kind not in "biuf":
+                X = X.astype(np.float64)
         except (TypeError, ValueError) as e:
             raise ValueError(f"{self.name}: X raqamli bo'lishi kerak ({e})") from None
         if X.ndim != 2:
             raise ValueError(f"{self.name}: X 2 o'lchamli (n, n_features) bo'lishi kerak, berilgan shakl {X.shape}")
-        expected = self.n_features_ if self.n_features_ is not None else self.n_features
+        expected = self.n_features if fitting or self.n_features_ is None else self.n_features_
         if expected is not None and X.shape[1] != expected:
             raise ValueError(f"{self.name}: feature'lar soni {X.shape[1]}, kutilgan {expected}")
-        bad = int(X.size - np.count_nonzero(np.isfinite(X)))
+        bad = 0
+        if X.dtype.kind == "f":          # bo'laklab: katta X uchun to'liq o'lchamli vaqtinchalik massiv yo'q
+            for i in range(0, len(X), _SCAN_ROWS):
+                c = X[i:i + _SCAN_ROWS]
+                bad += int(c.size - np.count_nonzero(np.isfinite(c)))
         if bad:
             raise ValueError(f"{self.name}: X da {bad} ta NaN/inf qiymat bor; faqat chekli qiymatlar qabul qilinadi.")
         return X
@@ -237,21 +252,21 @@ class SklearnModel(ModelWrapper):
         if self.name == "RandomForest":
             if not self.params["bootstrap"] and self.params["max_samples"] is not None:
                 log("  Ogohlantirish: RandomForest max_samples faqat bootstrap yoqilganda ishlaydi - e'tiborsiz qoldirildi.")
-            return _make_rf(self.params, self.seed, self.n_jobs), None
+            return _make_rf(self.params, self._rs, self.n_jobs), None
         if self.name == "SVM":
             return _make_svm(self.params), None
         spw = self.params["scale_pos_weight"]
         spw = float(n_neg) / float(n_pos) if spw is None else float(spw)
-        return _make_xgb(self.params, self.seed, self.n_jobs, spw), spw
+        return _make_xgb(self.params, self._rs, self.n_jobs, spw), spw
 
     def _calibrator(self, est, eff_cv, method):
         # shuffle=True: ichki fold'lar kirish tartibiga bog'liq bo'lmasin (seed bilan reproduktiv)
-        cv = StratifiedKFold(n_splits=eff_cv, shuffle=True, random_state=self.seed)
+        cv = StratifiedKFold(n_splits=eff_cv, shuffle=True, random_state=self._rs)
         return CalibratedClassifierCV(estimator=est, method=method, cv=cv, ensemble=False)
 
     def fit(self, X, y, patches=None, cancel=None, log_fn=None):
         log = log_fn or noop_log
-        X = self._check_X(X)
+        X = np.asarray(self._check_X(X, fitting=True), dtype=np.float64)
         y = self._check_y(y, len(X))
         n_pos = int(y.sum())
         n_neg = len(y) - n_pos
@@ -313,8 +328,8 @@ class SklearnModel(ModelWrapper):
         if bs < 1:
             raise ValueError(f"batch_size >= 1 bo'lishi kerak, berilgan {batch_size}")
         out = np.empty(len(X), dtype=np.float64)
-        for i in range(0, len(X), bs):
-            out[i:i + bs] = self.model_.predict_proba(X[i:i + bs])[:, 1]
+        for i in range(0, len(X), bs):      # float64 ga o'tkazish bo'lak-bo'lak (katta X uchun xotira tejaladi)
+            out[i:i + bs] = self.model_.predict_proba(np.asarray(X[i:i + bs], dtype=np.float64))[:, 1]
         return np.clip(out, 0.0, 1.0)
 
     # ---- talqin

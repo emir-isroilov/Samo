@@ -472,6 +472,87 @@ def test_refit_resets_state(xy):
     assert m.fit_info["n_train"] == 60 and m.fit_info["n_pos"] == 3
 
 
+@pytest.mark.parametrize("name", SK_MODELS)
+def test_refit_with_different_n_features(name, xy):
+    """Qayta fit() boshqa feature soni bilan mumkin (eski n_features_ qayta fit'ni to'smasin);
+    n_features konstruktorda e'lon qilingan bo'lsa fit uni baribir tekshiradi."""
+    X, y = xy
+    m = make_model(name, hp(name)).fit(X, y)
+    m.fit(X[:, :3], y)
+    assert m.predict_proba_pos(X[:, :3]).shape == (len(X),)
+    with pytest.raises(ValueError, match="feature'lar soni"):
+        m.predict_proba_pos(X)                         # endi 3 ta feature kutiladi
+    with pytest.raises(ValueError, match="feature'lar soni"):
+        make_model(name, hp(name), n_features=4).fit(X, y)
+
+
+# ---------------------------------------------------------------------------
+# Seed diapazoni, katta kirish (xotira), NaN tekshiruvi bo'laklari
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("calibrate", [True, False])
+@pytest.mark.parametrize("name", SK_MODELS)
+def test_seed_outside_uint32_range(name, calibrate, xy):
+    """Manfiy / 2**32 dan katta seed sklearn random_state'ni yiqitmasin; seed % (2**32-1) bilan ishlaydi."""
+    X, y = xy
+    ref = make_model(name, hp(name), calibrate=calibrate, seed=1).fit(X, y).predict_proba_pos(X)
+    for seed in (2 ** 32, 5 * (2 ** 32 - 1) + 1):        # ikkalasi ham 1 (mod 2**32-1)
+        m = make_model(name, hp(name), calibrate=calibrate, seed=seed).fit(X, y)
+        assert m.seed == seed
+        assert np.array_equal(m.predict_proba_pos(X), ref)
+    neg = make_model(name, hp(name), calibrate=calibrate, seed=-5).fit(X, y)
+    assert neg.seed == -5 and np.all(np.isfinite(neg.predict_proba_pos(X)))
+    if name != "SVM":
+        assert _inner(neg).get_params()["random_state"] == (-5) % (2 ** 32 - 1)
+
+
+@pytest.mark.parametrize("name", ["RandomForest", "XGBoost"])
+def test_predict_large_float32_no_full_float64_copy(name, xy):
+    """float32 kirish bo'lak-bo'lak float64 ga o'tadi: cho'qqi xotira kirish hajmidan oshmaydi."""
+    import tracemalloc
+    X, y = xy
+    Xb = np.tile(X, (150_000 // len(X) + 1, 1))[:150_000].astype(np.float32)
+    m = make_model(name, hp(name, n_estimators=10), calibrate=False).fit(X, y)
+    m.predict_proba_pos(Xb[:1000])                       # isitish (lazy import/keshlar)
+    tracemalloc.start()
+    try:
+        p = m.predict_proba_pos(Xb)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert p.shape == (len(Xb),)
+    assert peak < Xb.nbytes, f"cho'qqi xotira {peak} B >= kirish hajmi {Xb.nbytes} B"
+
+
+def test_nan_inf_counted_across_scan_chunks(xy):
+    """Katta X da NaN/inf bo'laklar bo'yicha yig'iladi (xabarda JAMI son) va oxirgi qatordagisi ham topiladi."""
+    X, y = xy
+    m = make_model("XGBoost", hp("XGBoost", n_estimators=5), calibrate=False).fit(X, y)
+    n = models_mod._SCAN_ROWS * 2 + 7
+    Xb = np.zeros((n, X.shape[1]), dtype=np.float32)
+    Xb[0, 0] = np.nan
+    Xb[models_mod._SCAN_ROWS + 3, 1] = np.inf
+    Xb[-1, 2] = -np.inf
+    with pytest.raises(ValueError, match=r"3 ta NaN/inf"):
+        m.predict_proba_pos(Xb)
+    Xb[~np.isfinite(Xb)] = 0.0
+    assert m.predict_proba_pos(Xb).shape == (n,)
+
+
+def test_non_float_input_dtypes(xy):
+    """int/bool/object kirishlar qabul qilinadi; raqamga aylanmaydigan object - aniq ValueError."""
+    X, y = xy
+    Xi = np.round(X * 10).astype(np.int32)
+    m = make_model("RandomForest", hp("RandomForest")).fit(Xi, y)
+    assert np.array_equal(m.predict_proba_pos(Xi), m.predict_proba_pos(Xi.astype(np.float64)))
+    assert m.predict_proba_pos(Xi.astype(object)).shape == (len(X),)
+    bad = Xi.astype(object)
+    bad[0, 0] = "abc"
+    with pytest.raises(ValueError, match="raqamli"):
+        m.predict_proba_pos(bad)
+    with pytest.raises(ValueError, match="raqamli"):
+        m.fit(bad, y)
+
+
 # ---------------------------------------------------------------------------
 # Kutubxona mavjud emas / CNN fabrikasi
 # ---------------------------------------------------------------------------

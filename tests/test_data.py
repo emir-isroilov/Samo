@@ -954,3 +954,123 @@ def test_manual_metadata_never_overwrites_existing_file(tmp_path):
     path.write_text("band_name,notes\na,birinchi\na,ikkinchi\n b ,xx\n", encoding="utf-8")
     manual, _ = D.load_or_create_manual_metadata(str(tmp_path), ["a", "b", "c"], log_fn=log)
     assert manual["a"]["notes"] == "birinchi" and manual["b"]["notes"] == "xx" and manual["c"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Mustaqil review regressiyalari
+# ---------------------------------------------------------------------------
+def test_find_files_skip_hidden_files(tmp_path):
+    """macOS '._x.tif' (AppleDouble) va yashirin fayllar ro'yxatga kirmaydi (asl koddagi glob ham olmagan)."""
+    for name in ("a.tif", "._a.tif", ".hidden.tiff", "real.shp", ".hidden.shp", "._real.shp"):
+        (tmp_path / name).write_bytes(b"")
+    assert [os.path.basename(p) for p in D.find_tiff_files(str(tmp_path))] == ["a.tif"]
+    assert os.path.basename(D.find_shapefile(str(tmp_path))) == "real.shp"
+
+
+def test_multiband_file_warns_and_uses_first_band(tmp_path):
+    path = tmp_path / "multi.tif"
+    arr = np.stack([np.full((30, 30), 1.0), np.full((30, 30), 2.0)]).astype("float32")
+    with rasterio.open(path, "w", driver="GTiff", height=30, width=30, count=2, dtype="float32",
+                       transform=from_origin(X0, Y0 + 3000, 100, 100), crs="EPSG:28411") as dst:
+        dst.write(arr)
+    msgs, log = _collect_log()
+    r = D.load_and_align_rasters([str(path)], log_fn=log)
+    assert r.stack.shape == (1, 30, 30) and (r.stack[0] == 1.0).all()
+    assert any("OGOHLANTIRISH" in m and "2 ta band" in m for m in msgs)
+
+
+def test_invalid_aoi_geometry_is_fixed_before_union(tmp_path):
+    """Noto'g'ri (galstuk) poligonli AOI to'g'ridan-to'g'ri berilganda ham GEOS TopologyException chiqmaydi."""
+    bow = Polygon([(X0 + 1000, Y0 + 1000), (X0 + 6000, Y0 + 6000), (X0 + 6000, Y0 + 1000), (X0 + 1000, Y0 + 6000)])
+    assert not bow.is_valid
+    aoi = gpd.GeoDataFrame(geometry=[bow, box(X0 + 7000, Y0 + 1000, X0 + 9000, Y0 + 3000)], crs="EPSG:28411")
+    geom = D._aoi_geometry(aoi)
+    assert geom.is_valid and geom.area > 0
+    for strategy in ("random", "grid", "distance_weighted"):
+        bg = D.generate_background_points(aoi, None, 40, 10.0, 1, strategy)
+        xy = D._gdf_xy(bg)
+        assert len(bg) == 40 and D._contains_xy(geom, xy[:, 0], xy[:, 1]).all()
+    shp = str(tmp_path / "p.shp")
+    gpd.GeoDataFrame(geometry=[Point(X0 + 2000, Y0 + 3500), Point(X0 + 8000, Y0 + 2000), Point(X0 + 9500, Y0 + 9500)],
+                     crs="EPSG:28411").to_file(shp)
+    assert len(D.load_positive_points(shp, aoi)) == 2
+
+
+def test_background_crs_conversion_and_label():
+    """AOI/musbatlar boshqa CRS'da bo'lsa ham koordinatalar 28411 da hosil bo'ladi va shunday belgilanadi."""
+    aoi = gpd.GeoDataFrame(geometry=[box(X0 + 200, Y0 + 200, X0 + 6000, Y0 + 6000)], crs="EPSG:28411")
+    pos = gpd.GeoDataFrame(geometry=[Point(X0 + 3000, Y0 + 3000)], crs="EPSG:28411")
+    bg = D.generate_background_points(aoi.to_crs(4326), pos.to_crs(4326), 40, 500.0, 5)
+    xy = D._gdf_xy(bg)
+    assert len(bg) == 40 and bg.crs.to_epsg() == TARGET_EPSG and xy[:, 0].min() > 1e6
+    assert D._contains_xy(D._aoi_geometry(aoi), xy[:, 0], xy[:, 1]).all()
+    assert cKDTree(D._gdf_xy(pos)).query(xy)[0].min() > 499.0
+    no_crs = gpd.GeoDataFrame(geometry=list(aoi.geometry), crs=None)
+    assert D.generate_background_points(no_crs, None, 5, 0.0, 1).crs is None          # CRS yo'q => 28411 deb olinadi
+
+
+def test_background_grid_thin_diagonal_aoi():
+    """bbox/maydon nisbati juda katta (ingichka diagonal AOI): grid 0 nuqta qaytarmaydi."""
+    side = 20000.0
+    thin = Polygon([(X0, Y0), (X0 + side, Y0 + side), (X0 + side, Y0 + side - 150), (X0 + 150, Y0)])
+    assert box(*thin.bounds).area / thin.area > 130
+    aoi = gpd.GeoDataFrame(geometry=[thin], crs="EPSG:28411")
+    for strategy in ("grid", "random"):
+        bg = D.generate_background_points(aoi, None, 100, 50.0, 3, strategy)
+        xy = D._gdf_xy(bg)
+        assert len(bg) == 100 and D._contains_xy(thin, xy[:, 0], xy[:, 1]).all()
+
+
+def test_extract_patches_integer_and_bool_stack():
+    """Butun/bool dtype feature_stack: float32 ga o'tkaziladi, chegara NaN (bool'da NaN True bo'lib ketmaydi)."""
+    rng = np.random.default_rng(0)
+    fs = rng.integers(0, 5, size=(2, 12, 12)).astype(np.int16)
+    rows, cols = np.array([0, 5, 11]), np.array([0, 6, 11])
+    got = D.extract_patches(fs, rows, cols, 3)
+    assert got.dtype == np.float32
+    np.testing.assert_array_equal(got, D.extract_patches(fs.astype(np.float32), rows, cols, 3))
+    assert np.isnan(got[0, 0]).all() and np.isfinite(got[1]).all()
+    flags = D.extract_patches(fs > 2, rows, cols, 3)
+    assert np.isnan(flags[0, 0]).all() and set(np.unique(flags[1])) <= {0.0, 1.0}
+
+
+def test_diagnostics_small_scale_layers_are_not_constant():
+    """Kichik masshtabli (1e-14) lekin o'zgaruvchan qatlam 'o'zgarmas' emas; haqiqiy o'zgarmaslari esa shunday qoladi."""
+    rng = np.random.default_rng(4)
+    a = rng.normal(size=(40, 40))
+    rs = _manual_raster([a * 1e-14, a * 1e-14 + 0.1e-14 * rng.normal(size=(40, 40)), rng.normal(size=(40, 40)),
+                         np.full((40, 40), 5.0), np.zeros((40, 40))], ["t1", "t2", "n", "c5", "c0"])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        d = D.data_diagnostics(rs)
+    corr, v = d["corr"], d["vif"].set_index("band")
+    assert corr.loc["t1", "t2"] > 0.9 and np.isfinite(corr.loc["t1", "t1"])
+    assert v.loc["t1", "flag"] == "yuqori" and v.loc["t2", "flag"] == "yuqori" and v.loc["n", "flag"] == "past"
+    assert v.loc["c5", "flag"] == "o'zgarmas" and v.loc["c0", "flag"] == "o'zgarmas" and np.isnan(v.loc["c5", "vif"])
+    assert [(r.band_a, r.band_b) for r in d["high_corr_pairs"].itertuples()] == [("t1", "t2")]
+
+
+def test_diagnostics_vif_needs_more_pixels_than_bands():
+    """Piksellar soni raqamli bandlardan ko'p bo'lmasa korrelyatsiya singular: VIF hisoblanmaydi."""
+    rs = _manual_raster([np.array([[1.0, 2.0]]), np.array([[2.0, 1.0]]), np.array([[3.0, 5.0]]), np.full((1, 2), 7.0)],
+                        ["a", "b", "c", "k"])
+    d = D.data_diagnostics(rs)
+    assert d["n_sample"] == 2
+    little = "ma'lumot yetarli emas"
+    assert d["vif"].set_index("band")["flag"].to_dict() == {"a": little, "b": little, "c": little, "k": "o'zgarmas"}
+    assert d["vif"]["vif"].isna().all()
+    rng = np.random.default_rng(0)
+    enough = D.data_diagnostics(_manual_raster([rng.normal(size=(1, 5)) for _ in range(3)], ["a", "b", "c"]))
+    assert enough["n_sample"] == 5 and np.isfinite(enough["vif"]["vif"]).all()
+
+
+def test_diagnostics_one_class_dataset_no_warning(raster, pipeline, pos_gdf, bg_gdf):
+    """Bir sinfli Dataset (masalan CV qismi): nanmean/nol bo'linish ogohlantirishlarisiz NaN jadval."""
+    ds = D.build_dataset(raster, pipeline, pos_gdf, bg_gdf)
+    for part in (ds.subset(np.arange(ds.n_pos)), ds.subset(np.arange(ds.n_pos, ds.n))):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            d = D.data_diagnostics(raster, part, max_pixels=100)
+        fe = d["feature_effects"]
+        assert fe["feature"].tolist() == raster.band_names and fe[["mean_pos", "mean_neg", "cohen_d", "auc"]].isna().all().all()
+        assert d["dataset_summary"]["n"] == part.n
