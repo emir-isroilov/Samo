@@ -1,0 +1,18 @@
+# MPM ML GUI v2 - asosiy bog'liqliklar
+# O'rnatish (conda muhitida):  pip install -r requirements.txt
+numpy>=1.24
+pandas>=1.5
+scipy>=1.10
+scikit-learn>=1.3,<2.0
+rasterio>=1.3
+geopandas>=0.14
+shapely>=1.8
+matplotlib>=3.7
+PyQt5>=5.15
+joblib>=1.3
+openpyxl>=3.1        # natijalarni .xlsx ga eksport qilish (ixtiyoriy: bo'lmasa CSV)
+
+# Modellar va talqin (ixtiyoriy - o'rnatilmasa tegishli model/tahlil o'chiriladi):
+xgboost>=2.0
+tensorflow>=2.15     # CNN uchun (Keras 3 bilan ham ishlaydi); CPU uchun: tensorflow-cpu
+shap>=0.44           # SHAP tahlili (beeswarm / dependence)
