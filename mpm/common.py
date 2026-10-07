@@ -144,7 +144,11 @@ def _lazy_import(modname):
         try:
             if modname == "tensorflow":
                 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-            mod = importlib.import_module(modname)
+            import warnings
+            with warnings.catch_warnings():
+                # uchinchi tomon import-vaqti ogohlantirishlari (-W error muhitida ham) importni yiqitmasin
+                warnings.simplefilter("ignore")
+                mod = importlib.import_module(modname)
         except Exception:
             mod = None
     _OPTIONAL_CACHE[modname] = mod
