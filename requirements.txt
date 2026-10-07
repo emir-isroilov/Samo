@@ -1,18 +1,30 @@
-# MPM ML GUI v2 - asosiy bog'liqliklar
-# O'rnatish (conda muhitida):  pip install -r requirements.txt
+# MPM ML GUI v2 - bog'liqliklar (Python >= 3.9)
+# O'rnatish:  pip install -r requirements.txt
+#
+# Sinalgan muhit (Python 3.13): numpy 2.5, pandas 3.0, scipy 1.18, scikit-learn 1.9, rasterio 1.5,
+# geopandas 1.2, shapely 2.1, matplotlib 3.11, PyQt5 5.15, joblib 1.6, openpyxl 3.1,
+# xgboost 3.4, tensorflow-cpu 2.21 (Keras 3.15), shap 0.52.
+# Quyidagi pastki chegaralar kod ishlatadigan API'lar bo'yicha qo'yilgan (eski versiyalar to'liq sinalmagan).
+#
+# Windows/macOS'da rasterio va geopandas'ni conda orqali o'rnatish osonroq:
+#   conda install -c conda-forge rasterio geopandas
+# so'ng qolganlarini pip bilan o'rnating.
+
+# --- Asosiy (majburiy) ---------------------------------------------------------------------------
 numpy>=1.24
 pandas>=1.5
 scipy>=1.10
-scikit-learn>=1.3,<2.0
+scikit-learn>=1.3      # CalibratedClassifierCV(estimator=..., ensemble=False), StratifiedGroupKFold
 rasterio>=1.3
-geopandas>=0.14
+affine>=2.3            # rasterio bilan birga keladi; mpm/data.py to'g'ridan-to'g'ri import qiladi
+geopandas>=0.14        # GeoDataFrame.explode(index_parts=...), union_all() (yo'q bo'lsa unary_union)
 shapely>=1.8
-matplotlib>=3.7
+matplotlib>=3.7        # Figure(layout="constrained"), matplotlib.colormaps
 PyQt5>=5.15
-joblib>=1.3
-openpyxl>=3.1        # natijalarni .xlsx ga eksport qilish (ixtiyoriy: bo'lmasa CSV)
+joblib>=1.3            # RF/SVM/XGBoost modellarini saqlash (bundle) va parallel bashorat
 
-# Modellar va talqin (ixtiyoriy - o'rnatilmasa tegishli model/tahlil o'chiriladi):
-xgboost>=2.0
-tensorflow>=2.15     # CNN uchun (Keras 3 bilan ham ishlaydi); CPU uchun: tensorflow-cpu
-shap>=0.44           # SHAP tahlili (beeswarm / dependence)
+# --- Ixtiyoriy (o'rnatilmasa, tegishli model/imkoniyat o'chadi; dastur ishlashda davom etadi) ----
+openpyxl>=3.1          # natijalarni .xlsx ga eksport (bo'lmasa faqat CSV yoziladi)
+xgboost>=2.0           # XGBoost modeli (yo'q bo'lsa o'tkazib yuboriladi)
+tensorflow>=2.16       # CNN modeli; Keras 3 kerak (keras.utils.PyDataset). Faqat CPU uchun: tensorflow-cpu
+shap>=0.42             # SHAP tahlili - beeswarm / dependence (yo'q bo'lsa o'tkazib yuboriladi)

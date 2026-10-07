@@ -1,3 +1,6 @@
+# Ishlab chiqish va testlash uchun:  pip install -r requirements-dev.txt
+# Testlar:  QT_QPA_PLATFORM=offscreen python -m pytest            (sekin testlarsiz: -m "not slow")
+# Statik tekshiruv:  python -m pyflakes mpm tests
 -r requirements.txt
 pytest>=7.0
 pyflakes>=3.0
