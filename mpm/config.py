@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from dataclasses import dataclass, field, fields, asdict
 
 from .common import RANDOM_STATE, default_n_jobs, MODEL_ORDER
@@ -198,6 +199,13 @@ def _coerce(spec, value):
     if spec.kind in ("optint", "optfloat") and value in (None, "", "none", "None"):
         return None, None
     if spec.kind == "bool":
+        if isinstance(value, str):
+            low = value.strip().lower()
+            if low in ("false", "0", "no", "yo'q", "yoq", "off", ""):
+                return False, None
+            if low in ("true", "1", "yes", "ha", "on"):
+                return True, None
+            return spec.default, f"{spec.name}: '{value}' mantiqiy qiymat emas, standart ishlatildi"
         return bool(value), None
     if spec.kind == "choice":
         v = str(value)
@@ -205,9 +213,12 @@ def _coerce(spec, value):
             return spec.default, f"{spec.name}: '{v}' ruxsat etilmagan, '{spec.default}' ishlatildi"
         return v, None
     try:
-        v = int(round(float(value))) if spec.kind in ("int", "optint") else float(value)
-    except (TypeError, ValueError):
-        return spec.default, f"{spec.name}: '{value}' son emas, standart ishlatildi"
+        fv = float(value)
+        if not math.isfinite(fv):
+            raise ValueError("chekli emas")
+        v = int(round(fv)) if spec.kind in ("int", "optint") else fv
+    except (TypeError, ValueError, OverflowError):
+        return spec.default, f"{spec.name}: '{value}' chekli son emas, standart ishlatildi"
     if spec.min is not None and v < spec.min:
         v, msg = type(v)(spec.min), f"{spec.name}: {spec.min} gacha oshirildi"
     if spec.max is not None and v > spec.max:
@@ -290,8 +301,15 @@ class TuningConfig:
         d = d or {}
         known = {f.name for f in fields(cls)}
         obj = cls(**{k: copy.deepcopy(v) for k, v in d.items() if k in known})
-        obj.inner_splits = int(max(2, obj.inner_splits))
-        obj.n_iter = int(max(1, obj.n_iter))
+        try:
+            obj.inner_splits = int(max(2, int(obj.inner_splits)))
+            obj.n_iter = int(max(1, int(obj.n_iter)))
+        except (TypeError, ValueError, OverflowError) as e:
+            raise ValueError(f"Tuning sozlamalari noto'g'ri (n_iter/inner_splits son bo'lishi kerak): {e}") from e
+        if not isinstance(obj.models, dict):
+            obj.models = {}
+        if not isinstance(obj.spaces, dict):
+            obj.spaces = {}
         if obj.scoring not in ("roc_auc", "average_precision"):
             obj.scoring = "roc_auc"
         return obj
@@ -422,8 +440,17 @@ def save_preset(path, hyperparams=None, tuning=None, cfg=None):
 def load_preset(path):
     """JSON'ni o'qiydi. Qaytaradi: {"kind": "hyperparams"|"run_config", "hyperparams": hp,
     "tuning": TuningConfig|None, "cfg": RunConfig|None, "warnings": [...]}"""
-    with open(path, "r", encoding="utf-8") as f:
-        payload = json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Preset fayli yaroqli JSON emas: {e}") from e
+    if not isinstance(payload, dict):
+        raise ValueError("Preset fayli noto'g'ri tuzilgan: ildiz JSON obyekti (lug'at) bo'lishi kerak.")
+    if "hyperparams" in payload and not isinstance(payload["hyperparams"], dict):
+        raise ValueError("Preset noto'g'ri: 'hyperparams' lug'at bo'lishi kerak.")
+    if "tuning" in payload and not isinstance(payload["tuning"], dict):
+        raise ValueError("Preset noto'g'ri: 'tuning' lug'at bo'lishi kerak.")
     kind = payload.get("kind", "hyperparams" if "hyperparams" in payload else "run_config")
     if kind == "run_config":
         cfg = RunConfig.from_dict(payload)

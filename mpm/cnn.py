@@ -476,7 +476,11 @@ class CNNModel(ModelWrapper):
             raise RuntimeError("O'qitilmagan CNN modelini saqlab bo'lmaydi.")
         os.makedirs(directory, exist_ok=True)
         model_path = os.path.join(directory, MODEL_FILE)
-        self.model_.save(model_path)
+        import warnings
+        with warnings.catch_warnings():
+            # keras 3 + numpy 2: ichki __array__(copy=) DeprecationWarning (kutubxona ichida, bizning xato emas)
+            warnings.filterwarnings("ignore", message=".*__array__ implementation.*", category=DeprecationWarning)
+            self.model_.save(model_path)
         meta = {"format": META_FORMAT, "params": self.params, "seed": self.seed, "n_jobs": self.n_jobs,
                 "mode": self.params["mode"], "n_features": self.n_features_,
                 "mean": [float(v) for v in self.mean_], "std": [float(v) for v in self.std_],
