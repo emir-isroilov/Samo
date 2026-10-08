@@ -11,7 +11,9 @@ Asl koddagi tuzatilgan xatolar:
 """
 from __future__ import annotations
 
+import io
 import os
+import re
 from dataclasses import dataclass, field
 
 import geopandas as gpd
@@ -78,8 +80,9 @@ class RasterStack:
 
     @property
     def pixel_size(self):
-        """Piksel o'lchami (metr)."""
-        return float(abs(self.transform.a))
+        """Piksel o'lchami (metr): piksel yuzining kvadrat ildizi (kvadrat bo'lmagan piksellarda ham to'g'ri maydon)."""
+        t = self.transform
+        return float(np.sqrt(abs(t.a * t.e - t.b * t.d)))
 
 
 def _stem(path):
@@ -188,6 +191,11 @@ def _align_band(arr, crs, info, ref_transform, ref_shape, dst_crs, categorical):
     return dst
 
 
+def _sig(x, digits=6):
+    """Ahamiyatli raqamlar bo'yicha yaxlitlash (kichik/katta masshtabli qatlamlar 0 ga aylanib ketmasin)."""
+    return float(f"{float(x):.{digits}g}")
+
+
 def _tech_entry(path, crs, info, ref_transform, band):
     valid = band[np.isfinite(band)]
     has = valid.size > 0
@@ -204,10 +212,10 @@ def _tech_entry(path, crs, info, ref_transform, band):
         "source_dtype": info["dtype"],
         "reprojected_resolution_m": round(float(abs(ref_transform.a)), 3),
         "valid_pixels_pct": round(100.0 * valid.size / band.size, 2) if band.size else 0.0,
-        "value_min": round(float(valid.min()), 4) if has else None,
-        "value_max": round(float(valid.max()), 4) if has else None,
-        "value_mean": round(float(valid.mean(dtype=np.float64)), 4) if has else None,
-        "value_std": round(float(valid.std(dtype=np.float64)), 4) if has else None,
+        "value_min": _sig(valid.min()) if has else None,
+        "value_max": _sig(valid.max()) if has else None,
+        "value_mean": _sig(valid.mean(dtype=np.float64)) if has else None,
+        "value_std": _sig(valid.std(dtype=np.float64)) if has else None,
     }
 
 
@@ -289,19 +297,73 @@ MANUAL_METADATA_FIELDS = ["band_name", "source_owner", "survey_or_scene_id", "su
                           "original_scale_or_resolution", "transformation_applied", "notes"]
 
 
+_METADATA_ENCODINGS = ("utf-8-sig", "utf-8", "cp1251", "cp1252")   # Excel mintaqaviy sozlamalariga qarab
+_METADATA_DELIMS = (",", ";")
+
+
+def _mixed_script_words(text):
+    """Bitta so'z ichida kirill VA lotin harflari aralashgan so'zlar soni (noto'g'ri kodlash belgisi)."""
+    return sum(1 for w in re.findall(r"\w+", text)
+               if re.search(r"[A-Za-z]", w) and re.search(r"[\u0400-\u04FF]", w))
+
+
+def _read_metadata_csv(path):
+    """metadata.csv ni ajratgich (',' / ';') va kodlashni (utf-8-sig, utf-8, cp1251, cp1252) avtomatik aniqlab o'qiydi.
+    Qaytaradi: (DataFrame (dtype=str), kodlash, ajratgich). 'band_name' ustuni topilmasa ham, o'qish muvaffaqiyatli
+    bo'lgan birinchi variant qaytariladi (chaqiruvchi ustun yo'qligini aniq xabar bilan bildiradi).
+    O'qib bo'lmasa (ikkilik/NUL baytli fayl, hech bir kodlash mos kelmaydi, jadval sifatida tahlil bo'lmaydi) ValueError."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    last_err = None
+    fallback = None
+    candidates = []                                 # (kodlash, matn): muvaffaqiyatli dekodlanganlar, tartib bo'yicha
+    for enc in _METADATA_ENCODINGS:
+        try:
+            text = raw.decode(enc)
+        except UnicodeDecodeError as e:
+            last_err = e
+            continue
+        if "\x00" in text:                         # matn emas (masalan UTF-16/ikkilik fayl)
+            last_err = ValueError("faylda NUL baytlar bor: matnli CSV emas (UTF-16/ikkilik fayl bo'lishi mumkin)")
+            continue
+        candidates.append((enc, text))
+    # cp1251/cp1252 bir xil baytlarni dekodlaydi: so'z ichida kirill va lotin harflari aralashgan bo'lsa (masalan
+    # "Geolуgico") bu noto'g'ri kodlash belgisi - aralashmagan variant oldinga o'tadi (teng bo'lsa asl tartib saqlanadi).
+    candidates = [c for c in candidates if c[0].startswith("utf")] + sorted(
+        (c for c in candidates if not c[0].startswith("utf")), key=lambda c: _mixed_script_words(c[1]))
+    for enc, text in candidates:
+        for sep in _METADATA_DELIMS:
+            try:
+                df = pd.read_csv(io.StringIO(text), sep=sep, dtype=str, keep_default_na=False)
+            except Exception as e:
+                last_err = e
+                continue
+            df.columns = [str(c).strip() for c in df.columns]
+            if "band_name" in df.columns:
+                return df, enc, sep
+            if fallback is None:
+                fallback = (df, enc, sep)
+    if fallback is not None:
+        return fallback
+    reason = last_err if last_err is not None else "fayl bo'sh"
+    raise ValueError(f"kodlash ({', '.join(_METADATA_ENCODINGS)}) va ajratgich (',' yoki ';') aniqlanmadi: {reason}")
+
+
 def load_or_create_manual_metadata(tiff_folder, band_names, log_fn=None):
     """
-    metadata.csv topilsa o'qiydi -> {band_name: {...}}. Topilmasa bo'sh shablon yaratadi va ogohlantiradi.
-    Mavjud (lekin o'qib bo'lmaydigan) fayl HECH QACHON ustiga yozilmaydi.
+    metadata.csv topilsa o'qiydi -> {band_name: {...}}; ajratgich (',' yoki ';') va kodlash (utf-8-sig, utf-8,
+    cp1251, cp1252) avtomatik aniqlanadi (Excel mintaqaviy sozlamasi). Topilmasa KIRISH TIFF papkasiga bo'sh shablon
+    yozadi va log'da buni aniq aytadi. Mavjud (lekin o'qib bo'lmaydigan) fayl HECH QACHON ustiga yozilmaydi.
     """
     log = log_fn or noop_log
     meta_path = os.path.join(tiff_folder, "metadata.csv")
     empty = {name: {} for name in band_names}
     if os.path.isfile(meta_path):
         try:
-            df = pd.read_csv(meta_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+            df, enc, sep = _read_metadata_csv(meta_path)
         except Exception as e:
-            log(f"  OGOHLANTIRISH: metadata.csv o'qib bo'lmadi ({e}); fayl o'zgartirilmadi, bo'sh metadata ishlatiladi.")
+            log(f"  OGOHLANTIRISH: metadata.csv o'qib bo'lmadi ({e}); fayl o'zgartirilmadi, bo'sh metadata ishlatiladi. "
+                f"Faylni Excel'da 'CSV UTF-8' formatida qayta saqlang.")
             return empty, meta_path
         if "band_name" not in df.columns:
             log("  OGOHLANTIRISH: metadata.csv'da 'band_name' ustuni yo'q; bo'sh metadata ishlatiladi.")
@@ -312,17 +374,22 @@ def load_or_create_manual_metadata(tiff_folder, band_names, log_fn=None):
         df["band_name"] = df["band_name"].str.strip()
         df = df.drop_duplicates("band_name").set_index("band_name")
         manual = {name: (df.loc[name].to_dict() if name in df.index else {}) for name in band_names}
-        log(f"  metadata.csv topildi va o'qildi: {meta_path}")
+        fmt = ""
+        if sep != "," or enc not in ("utf-8-sig", "utf-8"):
+            fmt = f" (avtomatik aniqlandi: ajratgich '{sep}', kodlash {enc})"
+        log(f"  metadata.csv topildi va o'qildi: {meta_path}{fmt}")
         return manual, meta_path
 
     rows = [{f: (name if f == "band_name" else "") for f in MANUAL_METADATA_FIELDS} for name in band_names]
     try:
-        pd.DataFrame(rows).to_csv(meta_path, index=False)
-        log(f"  OGOHLANTIRISH: metadata.csv topilmadi. Bo'sh shablon yaratildi: {meta_path}\n"
+        pd.DataFrame(rows).to_csv(meta_path, index=False, encoding="utf-8-sig")     # Excel kirill/o'zbek harflarini tanisin
+        log(f"  OGOHLANTIRISH: metadata.csv topilmadi. Bo'sh shablon KIRISH TIFF papkasiga yozildi: {meta_path} "
+            f"(yon ta'sir: kirish papkasida yangi fayl paydo bo'ldi).\n"
             f"  Predictor data dictionary'ni to'liq qilish uchun uni source_owner, survey_date, "
             f"transformation_applied va boshqa ustunlar bilan to'ldiring.")
     except Exception as e:
-        log(f"  OGOHLANTIRISH: metadata.csv shablonini yaratib bo'lmadi ({e}).")
+        log(f"  OGOHLANTIRISH: metadata.csv shablonini yaratib bo'lmadi ({e}); kirish papkasi '{tiff_folder}' "
+            f"yozishga ruxsat bermaydi bo'lishi mumkin.")
     return empty, meta_path
 
 
@@ -790,11 +857,12 @@ class _BgSampler:
         return x, y, d
 
 
-def _bg_collect(sampler, rng, target, max_attempts):
+def _bg_collect(sampler, rng, target, max_attempts, cancel=None):
     """Tekis nomzodlarni batch'lab yig'adi, to'g'ri nuqtalar `target` ga yetguncha (yoki urinishlar tugaguncha)."""
     xs, ys, ds = [], [], []
     have = attempts = 0
     while have < target and attempts < max_attempts:
+        check_cancel(cancel)
         batch = int(min(max(4096, 6 * (target - have)), _MAX_BATCH, max_attempts - attempts))
         x, y, d = sampler.accept(*sampler.draw(rng, batch))
         attempts += batch
@@ -807,13 +875,14 @@ def _bg_collect(sampler, rng, target, max_attempts):
     return np.concatenate(xs), np.concatenate(ys), np.concatenate(ds), attempts
 
 
-def _bg_grid(sampler, rng, n_points, max_cells):
+def _bg_grid(sampler, rng, n_points, max_cells, cancel=None):
     """AOI ustida jitterli to'r: yetarli nomzod chiqquncha katakni kichraytiradi, keyin n_points tanlanadi."""
     minx, miny, maxx, maxy = sampler.bounds
     w, h = maxx - minx, maxy - miny
     cell = float(np.sqrt(max(sampler.aoi.area, 1e-12) / (1.5 * n_points)))
     best, attempts = (np.empty(0), np.empty(0)), 0
     for _ in range(60):
+        check_cancel(cancel)
         nx, ny = int(np.ceil(w / cell)), int(np.ceil(h / cell))
         if nx * ny > max_cells:
             if attempts:
@@ -839,7 +908,7 @@ def _bg_grid(sampler, rng, n_points, max_cells):
 
 def generate_background_points(aoi_gdf, positive_gdf, n_points, min_distance, random_state=RANDOM_STATE,
                                strategy="random", valid_mask=None, transform=None, max_attempts_factor=200,
-                               log_fn=None):
+                               log_fn=None, cancel=None):
     """
     AOI ichida, musbat nuqtalardan kamida min_distance uzoqlikdagi fon (pseudo-absence) nuqtalar.
     strategy: "random" (AOI ∩ valid_mask ichida tekis), "grid" (jitterli to'r, keyin tanlanadi),
@@ -862,17 +931,20 @@ def generate_background_points(aoi_gdf, positive_gdf, n_points, min_distance, ra
         if valid_mask.ndim != 2:
             raise ValueError(f"valid_mask 2 o'lchamli (H, W) bo'lishi kerak, berilgan: {valid_mask.shape}")
 
-    rng = np.random.default_rng(random_state)
+    rng = np.random.default_rng(int(random_state) % (2 ** 32 - 1))
     positive_gdf = _in_target_crs(positive_gdf)
     pos_xy = _gdf_xy(positive_gdf) if positive_gdf is not None and len(positive_gdf) else np.empty((0, 2))
     sampler = _BgSampler(_aoi_geometry(aoi_gdf), pos_xy, min_distance, valid_mask, transform)
     max_attempts = max(int(n_points * max_attempts_factor), 1000)
+    if valid_mask is not None:
+        # har pikselga bittadan nuqta: mavjud piksellardan ko'p so'ralsa behuda uzoq urinmaymiz
+        max_attempts = min(max_attempts, 50 * int(valid_mask.sum()) + 10_000)
 
     if strategy == "grid":
-        x, y, attempts = _bg_grid(sampler, rng, n_points, max_cells=max_attempts)
+        x, y, attempts = _bg_grid(sampler, rng, n_points, max_cells=max_attempts, cancel=cancel)
     else:
         pool = n_points if strategy == "random" else max(20 * n_points, 2000)
-        x, y, d, attempts = _bg_collect(sampler, rng, pool, max_attempts)
+        x, y, d, attempts = _bg_collect(sampler, rng, pool, max_attempts, cancel=cancel)
         if strategy == "distance_weighted" and not len(pos_xy):
             log("  OGOHLANTIRISH: musbat nuqta yo'q, distance_weighted o'rniga tekis tanlov ishlatildi.")
         if x.size > n_points:
@@ -1089,7 +1161,7 @@ def data_diagnostics(raster, dataset=None, max_pixels=50000, seed=RANDOM_STATE):
         raise ValueError("max_pixels kamida 2 bo'lishi kerak.")
     num_idx = [j for j, b in enumerate(raster.band_names) if b not in raster.categorical]
     names = [raster.band_names[j] for j in num_idx]
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(int(seed) % (2 ** 32 - 1))
 
     sample = np.empty((0, len(num_idx)))
     if num_idx:

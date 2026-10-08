@@ -134,8 +134,11 @@ def valid_pixel_mask(stack) -> (H,W) bool      # barcha bandlar chekli (ndarray 
 MANUAL_METADATA_FIELDS = ["band_name", "source_owner", "survey_or_scene_id", "survey_date",
                           "original_scale_or_resolution", "transformation_applied", "notes"]
 load_or_create_manual_metadata(tiff_folder, band_names, log_fn=None) -> (dict, path)
-    # <tiff_folder>/metadata.csv (UTF-8, vergul) topilsa o'qiydi; topilmasa bo'sh SHABLONNI SHU PAPKAGA YOZADI (yon ta'sir!).
-    # Mavjud, lekin o'qib bo'lmaydigan fayl HECH QACHON ustiga yozilmaydi.
+    # <tiff_folder>/metadata.csv topilsa o'qiydi: ajratgich (',' yoki ';') va kodlash (utf-8-sig, utf-8, cp1251, cp1252)
+    # AVTOMATIK aniqlanadi (Excel mintaqaviy sozlamasi; cp1251/cp1252 noaniqligida so'z ichida kirill+lotin aralashgan
+    # variant rad etiladi); noan'anaviy format log'da yoziladi. Topilmasa bo'sh SHABLONNI SHU (KIRISH TIFF) PAPKAGA
+    # YOZADI (yon ta'sir!) va log'da buni aniq aytadi. Mavjud, lekin o'qib bo'lmaydigan (NUL baytli/bo'sh/jadval emas) yoki
+    # 'band_name' ustunsiz fayl HECH QACHON ustiga yozilmaydi: aniq ogohlantirish + bo'sh metadata.
 build_data_dictionary(band_names, tech_metadata, manual_metadata) -> DataFrame   # tech_metadata + qo'lda maydonlar
 save_data_dictionary(df, out_dir, log_fn=None) -> path        # <out_dir>/predictor_data_dictionary.csv
 
@@ -309,7 +312,7 @@ def run_cv(dataset, groups, cv_mode, model_names, hp, *, n_splits, n_repeats, ca
     # Model xatosi jim yutilmaydi: aniq log + RuntimeError.
 def compute_metrics(y, oof, groups=None, n_boot=1000, seed=RANDOM_STATE, log_fn=None) -> (dict, ensemble_mean_proba)
     # kalitlar: har model + ENSEMBLE_NAME ("Ensemble (soft-voting)": har repeat ichida modellar oddiy o'rtachasi). Har biri uchun:
-    #  "auc"(repeat-o'rtacha), "auc_std"(repeat), "auc_ci95"(blok-bootstrap, (lo,hi); n_boot=0 => (nan,nan)), "auc_single"
+    #  "auc"(repeat-o'rtacha), "auc_std"(repeat; n_repeats==1 bo'lsa NaN - 0.0 EMAS, barcha "*_std" kalitlari ham), "auc_ci95"(blok-bootstrap, (lo,hi); n_boot=0 => (nan,nan)), "auc_single"
     #  (o'rtacha OOF ustida), "auc_repeats" (har repeat AUC massivi), "pr_auc","balanced_accuracy","f1","brier",
     #  "balanced_accuracy_youden","f1_youden" va ularning "_std", "_ci95" variantlari,
     #  "threshold_youden", "sensitivity","specificity" (Youden bo'sag'ida), "confusion" ([[tn,fp],[fn,tp]]),
@@ -318,12 +321,15 @@ def compute_metrics(y, oof, groups=None, n_boot=1000, seed=RANDOM_STATE, log_fn=
     #  balanced_accuracy/f1 bo'sag'i 0.5; "*_youden" - o'rtacha OOF'dan topilgan Youden bo'sag'i.
     #  Eslatma: "auc" repeat-o'rtacha, CI esa o'rtacha bashorat ustida bootstrap: nuqta qiymat CI chetiga yaqin (yoki
     #  tashqarisida) chiqishi mumkin.
-def metrics_dataframe(results, label="") -> DataFrame   # bir qator har model: [CV,] Model, AUC, AUC_std, AUC_CI_lo, AUC_CI_hi, PR_AUC, BalAcc, F1, Brier, Sens, Spec, Thr
+def metrics_dataframe(results, label="") -> DataFrame   # bir qator har model: [CV,] Model, AUC, AUC_std (1 repeat: NaN), AUC_CI_lo, AUC_CI_hi, PR_AUC, BalAcc, F1, Brier, Sens, Spec, Thr
+    # NaN: CSV/XLSX'da bo'sh katak, summary.txt'da "(std: -, 1 takror)", GUI jadvalida bo'sh katak, grafiklarda xato chizig'i yo'q.
 def youden_threshold(y, p) -> float
 def run_background_sensitivity(aoi_gdf, positive_gdf, raster, pipeline, hp, *, model_names, n_background, min_distance,
         strategy, block_size, n_draws, n_splits, n_repeats, calibrate, calibration_method, calibration_cv,
-        n_jobs, seed, log_fn=None, progress_fn=None, cancel=None) -> dict|None
+        n_jobs, seed, log_fn=None, progress_fn=None, cancel=None, feature_stack=None) -> dict|None
     # har draw: seed + 1000 + draw; bazaviy hp (tuning YO'Q), spatial CV, n_boot=0. Imkonsiz draw o'tkazib yuboriladi.
+    # feature_stack (ixtiyoriy, CNN patch2d): tayyor (n_features,H,W) stek (pipeline dataset.feature_stack'ni uzatadi); berilmasa
+    #   bir marta quriladi; har holda barcha draw'lar orasida ULASHILADI (stek nuqtalarga bog'liq emas) - qayta qurilmaydi.
     # {"per_draw": [{"draw","seed","auc":{name:auc},"n_background","block_size"}], "summary": {name:{"mean","std","min","max","values"}},
     #  "n_positive", "n_draws", "n_draws_requested"}; hech draw bajarilmasa None.
 ```
@@ -362,6 +368,7 @@ def save_bundle(directory, *, final_models, pipeline, hyperparams_used, cfg_dict
     # manifest kalitlari: bundle_version(=1), created_utc, mpm_version, versions, band_names, categorical, feature_names, n_features,
     #   model_names, models {name: {n_draws, dir, class, input_kind, loader: "joblib"|"keras", params}}, hyperparams_used, cfg,
     #   metrics_summary, thresholds, block_size, crs_epsg, ensemble_name, notes, security_warning.
+    # directory mavjud FAYL bo'lsa (yoki yo'lning biror qismi fayl) "[Errno 17] File exists" o'rniga aniq ValueError ("... papka emas").
     # Mavjud bundle ustiga yozilsa eski models/ o'chiriladi; MPM bundle bo'lmagan papkaga yozishdan bosh tortadi (ValueError);
     # yarim saqlangan bundle (manifest yo'q) yuklanmaydi.
 def load_bundle(directory, log_fn=None) -> dict   # {"final_models","pipeline","manifest","cfg","hyperparams_used","metrics_summary",
@@ -389,7 +396,7 @@ def export_results(result, out_dir, prediction=None, log_fn=None) -> list[paths]
 def estimate_cost_text(cfg: RunConfig|dict) -> str   # taxminiy o'qitish/ichki fit soni va ogohlantirishlar (GUI cost hint); hech qachon xato bermaydi
 ```
 `cfg` dict ham qabul qilinadi (`RunConfig.from_dict`); `cfg.validate()` muammolari => `ValueError` (ro'yxat bilan).
-Bekor qilinsa xom `CancelledError` ko'tariladi.
+Bekor qilinsa xom `CancelledError` ko'tariladi (bekor qilish qarori uchun "Pipeline tartibi"dan keyingi izohga qarang).
 
 **TrainingResult** kalitlari:
 `cfg(dict), band_names, feature_names, categorical_layers, raster(RasterStack), pipeline(FeaturePipeline),
@@ -415,13 +422,19 @@ Tuning semantikasi (MUHIM): `cfg.tuning.mode="nested"` bo'lsa spatial CV har tas
 ham, `mode="final"` ham) — faqat 0-fon tanlovida (CV dataset'i), qolgan fon tanlovlari shu giperparametrlarni ishlatadi.
 `mode="final"` bo'lsa spatial CV bazaviy hp bilan baholanadi (nested tuning yo'q): GUI faqat `nested` rejimini ko'rsatadi
 (`TuningGroup` rejimni o'zgartirmaydi, preset'dan kelgan qiymatni saqlaydi). Random CV har doim bazaviy hp bilan, tuning va
-importance'siz (faqat benchmark).
+importance'siz (faqat benchmark). `mode != "nested"` va tuning ishlaydigan model bor bo'lsa `result["warnings"]` ga aniq
+ogohlantirish yoziladi ("CV metrikalari bazaviy giperparametrlar bilan, yakuniy model tuned hp bilan"); `summary.txt`
+"Random vs Spatial" bo'limida ham izoh bor (nested: random bazaviy, spatial tuning bilan - "optimizm" qisman tuning farqi;
+final: ikkala CV bazaviy hp bilan). `summary.txt` da `best_score` `{:.4f}`, `best_params` `{:.4g}` formatida.
 
 Pipeline tartibi (progress oralig'i, monoton 0.0 -> 1.0): rasterlar (0-6%) + metadata (8%) -> nuqtalar/fon/dataset (12%) ->
 diagnostika (14%) -> blok o'lchami (16%) -> random CV (16-36%, o'chirilishi mumkin) -> spatial CV (36-70%) -> bg sensitivity
 (70-80%, ixtiyoriy) -> yakuniy modellar (80-92%; K fon tanlovi x model, yakuniy tuning shu oraliqda) -> importance (92-95%) ->
-SHAP (95-98%) -> yakun (100%). Bekor qilish ~95% dan keyin hisoblashni to'xtata olmaydi (qolgan ish millisekundlar):
-`finished_signal` kelsa ham Stop bosilgan bo'lishi mumkin. Patch-CNN uchun blok o'lchami < oyna*piksel bo'lsa
+SHAP (95-98%) -> yakun (100%). **Bekor qilish qarori:** `check_cancel` importance'ning har modelida, importance -> SHAP
+orasida va SHAP ichida chaqiriladi (Stop SHAP bosqichigacha, shu jumladan SHAP vaqtida ham ishlaydi => `CancelledError`).
+SHAP tugagach yakunlash (bo'sag'lar, vaqtlar, natija lug'ati; millisekundlar) BEKOR QILINMAYDI: ishning ~99% bajarilgan, shu
+paytda Stop bosilgan bo'lsa ham tayyor natija qaytariladi (`finished_signal` kelsa ham Stop bosilgan bo'lishi mumkin) -
+natija yo'qotilmaydi. Patch-CNN uchun blok o'lchami < oyna*piksel bo'lsa
 ogohlantirish (patchlar train/val orasida ustma-ust tushadi). Barcha ogohlantirishlar (`"Ogohlantirish:"` qatorlari)
 `result["warnings"]` ga ham yig'iladi (<= 300 ta). Log fayli: `cfg.output_dir` berilgan bo'lsa `<output_dir>/mpm_run_<n>.log` (UTF-8, ketma-ket n).
 CNN va boshqa modellar birga bo'lsa ansambl oddiy o'rtacha: CNN kalibrlanmaydi va neg/pos og'irlik bilan o'qitiladi, shuning uchun
@@ -450,8 +463,11 @@ ishlaydi (testlar). Pipeline/persist modullari ishchi ichida lazy import qilinad
 
 * `widgets.py`: `FolderPicker(label_text="", parent=None, label_width=220)` (`.path()`, `.setPath()`, signal `changed(str)`);
   `MplCanvas(parent=None, figsize=(6,4.5), dpi=100, with_toolbar=True)` (`.fig` (constrained layout), `.canvas`, `.toolbar`
-  (`NavigationToolbar2QT`), `.redraw()` (xato yutiladi, `.last_error`), `.clear()`, `.save_figure(path, dpi=300)`; minimal o'lcham juda
-  kichik (200x150) — natija tab'larini `QScrollArea` ichiga qo'ying yoki canvasni ~6x4.5 dyuymdan kichik qilmang);
+  (`NavigationToolbar2QT`), `.redraw()` (SINXRON; xato yutiladi, `.last_error`), `.clear()`, `.save_figure(path, dpi=300)`; minimal o'lcham juda
+  kichik (200x150)). `.canvas` — `_PhasedCanvas(FigureCanvasQTAgg)`: `draw_idle()` (oyna/tab o'lchami o'zgarishi, zoom/pan) ikki
+  hodisa-tsikl bosqichiga bo'linadi (1 layout, 2 rasterlash; `PHASE_PAUSE_MS` pauza), layout dvigateli vaqtincha o'chirilib
+  har doim tiklanadi (~0.6 s qotish o'rniga ~0.2-0.3 s bo'laklar);
+  `elide_text(text, limit=150)` (oxiriga `...`); `ProgressPanel.stopped(msg, tooltip=None)` (qisqartirilgan matnning to'liq varianti tooltip'da);
   `DataFrameTable(parent=None, max_rows=20000)` (`.set_dataframe(df, float_fmt="{:.3f}"|dict)`, NaN -> bo'sh katak, son/matn bo'yicha
   saralash, Ctrl+C TSV nusxalash, `.save_csv(path=None)` utf-8-sig, to'liq df); `ProgressPanel` (bar + bosqich matni + o'tgan vaqt/ETA;
   `.update_progress(frac|0..100, msg)`, `.reset()`, `.finish(msg)`, `.stopped(msg)`: yangi ish boshlashda `reset()`, bekor/xatoda
@@ -478,13 +494,30 @@ ishlaydi (testlar). Pipeline/persist modullari ishchi ichida lazy import qilinad
   `SearchSpaceDialog(tuning)` — tunable parametr oraliqlarini jadvalda tahrirlash (xato bo'lsa dialog yopilmaydi).
 * `result_tabs.py`: natija tab'lari (har biri `QWidget`; `MplCanvas`/`DataFrameTable` + `plots.draw_*`; bo'sh natijada "Hali natija yo'q"):
   ma'lumotlar tahlili, natijalar (Spatial/Random CV metrikalari, ROC/PR/kalibrlash/confusion, CSV/XLSX va grafiklarni saqlash),
-  spatial CV diagnostika (fold jadvali, fon sezgirligi, tuning natijalari, ogohlantirishlar), feature importance (permutation + SHAP),
-  prognoz xarita (sinflash sozlamalari, xarita, success-rate, sinf statistikasi, eksport).
-* `main_window.py`: `MainWindow` (tablar: 1 Ma'lumotlar va o'qitish, 2 Giperparametrlar, 3 Ma'lumotlar tahlili, 4 Natijalar,
-  5 Spatial CV diagnostika, 6 Feature importance, 7 Prognoz xarita, 8 Modellar), `main(argv=None)`; global `sys.excepthook`,
-  `closeEvent` (ishchi ishlayotgan bo'lsa tasdiq so'rab `cancel()`), `_set_busy(bool)` (BARCHA tugmalar holati bitta joyda),
-  `_collect_config() -> RunConfig` / `_apply_config(cfg)`. Barcha uzoq ishlar `workers.*` orqali (GUI qotmaydi).
-* Ildizda `mpm_ml_gui.py`: `from mpm.gui.main_window import main; main()`.
+  spatial CV diagnostika (sahifalar: Diagnostika grafigi, Fold jadvali, Fon sezgirligi, Tuning, Ogohlantirishlar (`SpatialTab.WARN_TAB`)),
+  feature importance (permutation + SHAP), prognoz xarita (sinflash sozlamalari, xarita, success-rate, sinf statistikasi, eksport).
+  **Tembel (lazy) chizish:** `tab.lazy_fill = True` bo'lganda `set_result`/`set_prediction`/`set_diagnostics` faqat yengil qismlarni
+  (jadval, yorliq) darhol bajaradi; og'ir canvas chizishlari canvas BIRINCHI KO'RSATILGANDA (`QEvent.Show` -> `QTimer`) `plots.draw_*`
+  (artist'lar) + canvas'ning bosqichli `draw_idle()` i orqali bajariladi; ko'rinmagan tab'lar chizilmaydi. API:
+  `pending_count()`, `visible_pending_count()`, `flush_one()`, `flush()` (SINXRON, testlar/saqlash uchun). Standart (`lazy_fill=False`) -
+  hammasi darhol (sinxron). `_begin()`/`clear()` eskirgan kutayotgan chizishlarni tashlaydi. Tab tanasi (`QScrollArea` ichida):
+  canvas minimal o'lchami ~480x240, `_FlatVBox`/`_Tabs` `heightForWidth` ni uzatmaydi (aks holda scroll tana balandligini sizeHint
+  bo'yicha hisoblab, canvas pastki qismi ko'rinmay qolardi); uzun izohlar `_NoteBox` (yig'iladigan) da; `MapTab.figures()` kalitlari
+  `map_<Model>`, `map_uncertainty`, `map_classes`, `success_rate`.
+* `main_window.py`: `MainWindow` (tablar `TAB_TITLES`: "1. Ma'lumotlar", "2. Giperparametrlar", "3. Tahlil", "4. Natijalar",
+  "5. Spatial CV", "6. Importance", "7. Xarita", "8. Modellar"; to'liq nomlar `TAB_TOOLTIPS` da, tooltip sifatida), `main(argv=None) -> int`;
+  boshlang'ich o'lcham `initial_window_size(avail_w, avail_h)` = min(1400x900, ekran availableGeometry'ning 90%), kamida 980x640;
+  global `sys.excepthook`, `closeEvent` (ishchi ishlayotgan bo'lsa tasdiq so'rab `cancel()`), `_set_busy(bool)` (BARCHA tugmalar holati
+  bitta joyda), `_collect_config() -> RunConfig` / `_apply_config(cfg)` (NaN/inf qiymat vidjetga TEGMAYDI + ogohlantirish; umuman
+  son bo'lmagan qiymat `ValueError`). Barcha uzoq ishlar `workers.*` orqali (GUI qotmaydi).
+  1-tab: yuqorida sozlamalar (scroll), o'rtada tugmalar + bir qatorli progress, pastda yig'iladigan `QTabWidget` (Log / Taxminiy
+  hisob-kitob) - `main_splitter` (3 bo'lak, oxirgisi yig'iladi). 2-tab: `HyperParamPanel` to'g'ridan-to'g'ri (tashqi scroll yo'q).
+  **Tembel to'ldirish:** `_fill_tabs(result)` tab'larni `lazy_fill` bilan to'ldiradi; `fill_pending()` (ko'rinib turgan, chizilishi
+  tugamagan canvas'lar), `fill_all_now()` (hammasini sinxron chizadi), `wait_idle()` ko'rinmaganlarni kutmaydi.
+  Xato matni progress qatorida 150 belgidan oshsa `...` bilan qisqartiriladi (to'liq matn tooltip'da); `autoexport` xatosi
+  "Tayyor" holatini o'zgartirmaydi (faqat log + status). `format_manifest` har bo'lim uchun alohida try/except; `_select_bundle`
+  esa buzuq tuzilishli manifest'ni (`band_names` ro'yxat emas va h.k.) rad etadi.
+* Ildizda `mpm_ml_gui.py`: `sys.exit(main())` (chiqish kodi `main()` dan).
 
 ## 4. O'zgarishlar jadvali: asl koddan (legacy) nima tuzatildi va nima qo'shildi
 
@@ -535,17 +568,36 @@ hozirgi modul va funksiya, "Test" ustunida tasdiqlovchi test fayli (va muhim tes
   bilan baholanadi; "optimizm = random - spatial" farqi qisman shundan ham bo'lishi mumkin (log'da yoziladi).
 * **Permutation importance** faqat spatial CV'ning 1-takrorida, har fold'ning validation qismida hisoblanadi; MDI zaxirasida
   `std = 0` (xato chiziqlari chizilmaydi).
+* **1 repeat (`n_repeats=1`) da repeat-std ma'nosiz:** `compute_metrics` barcha `*_std` ni NaN qiladi (0.0 emas); ishonch oralig'i
+  (`*_ci95`, blok-bootstrap) saqlanadi. Fon sezgirligida 1 ta draw bo'lsa `summary[name]["std"]` hali 0.0 (qiymatlar soni 1),
+  `summary.txt` da esa "(1 tanlov: std yo'q)" deb ko'rsatiladi.
+* **Ixtiyoriy kutubxona import xatosi:** `common._lazy_import` import yiqilsa `None` keshlaydi, lekin sababni ham saqlaydi:
+  `common.import_error(modname) -> str|None` ("XatoTuri: xabar", <= 300 belgi; modul haqiqatan o'rnatilmagan bo'lsa `None`).
+  `pipeline` (XGBoost/TensorFlow/SHAP) va `explain.compute_shap_summary` "o'rnatilmagan" o'rniga modul nomi + haqiqiy xatoni
+  ogohlantiradi. CNN yoqilgan bo'lsa `pipeline._prepare` TensorFlow'ni erta import qilib ko'radi (muvaffaqiyatsiz => CNN
+  o'tkazib yuboriladi, ish o'rtasida yiqilmaydi).
 * **SHAP** faqat RF va XGBoost uchun, faqat birinchi fon tanlovidagi yakuniy model bilan, `shap_max_background` ta qatorda;
   birliklar modelga bog'liq (RF: ehtimollik, XGBoost: log-odds). `common.get_shap()` `None` keshlashi mumkin (o'rnatilmagan bo'lsa).
 * **success-rate** o'qitish nuqtalarida hisoblanadi (optimistik), mustaqil validatsiya emas. **noaniqlik xaritasi** — alohida
   modellar xaritalarining std'i (modellar kelishmovchiligi), statistik ishonch oralig'i emas.
 * **CNN** chiqishi kalibrlanmaydi va neg/pos og'irlik bilan o'qitiladi; ansambl oddiy o'rtacha bo'lgani uchun shkalalar farq qilishi mumkin.
-* **`run_background_sensitivity`** bazaviy hp bilan ishlaydi (tuning yo'q) va CNN patch2d bo'lsa har draw'da to'liq `feature_stack`
-  qayta quradi (katta rasterda xotira/vaqt qimmat).
-* **Cancel** ~95% dan keyin hisoblashni to'xtata olmaydi (`finished_signal` kelsa ham Stop bosilgan bo'lishi mumkin).
-* **`metadata.csv` yon ta'siri:** `data.load_or_create_manual_metadata` TIFF papkasiga bo'sh shablon YOZADI (bor bo'lsa tegmaydi).
+* **`run_background_sensitivity`** bazaviy hp bilan ishlaydi (tuning yo'q); CNN patch2d bo'lsa `feature_stack` pipeline'dan
+  uzatiladi (yoki bir marta quriladi) va barcha draw'lar orasida ulashiladi.
+* **Cancel** SHAP bosqichigacha (va SHAP ichida) ishlaydi; SHAP tugagach yakunlash bekor qilinmaydi: `finished_signal` kelsa
+  ham Stop bosilgan bo'lishi mumkin (natija saqlanadi).
+* **`metadata.csv` yon ta'siri:** `data.load_or_create_manual_metadata` KIRISH TIFF papkasiga bo'sh shablon YOZADI (bor bo'lsa
+  tegmaydi; log'da aniq aytiladi). Mavjud fayl ajratgich (',' / ';') va kodlash (utf-8-sig/utf-8/cp1251/cp1252) bo'yicha
+  avtomatik aniqlanadi.
 * **Versiyalar:** `common.collect_versions` paketni `importlib.metadata` nomi bilan qidiradi (`tensorflow`); faqat `tensorflow-cpu`
   o'rnatilgan muhitda `versions.json`/`manifest.json` da `tensorflow: null` chiqadi va bundle yuklashdagi TensorFlow versiya-farqi
   ogohlantirishi ishlamaydi.
+* **GUI tembel chizish:** natija tab'larining og'ir canvas'lari tab (sahifa) birinchi ko'rsatilganda chiziladi (o'qitish tugagach
+  qotish yo'q: 100x100 sintetik loyihada QTimer(20 ms) tikkerining eng katta oralig'i ~0.3 s, sinxron to'ldirishda ~2.8 s edi).
+  Bitta og'ir grafik ham bosqichlarga bo'linadi (chizish / layout / rasterlash), lekin har bosqich o'zi matplotlib'ning bir
+  yo'la ishi: juda ko'p panelli grafikda (20+ feature) bosqich ~0.5 s dan oshishi mumkin. Ko'rinmagan tab'lar chizilmagani uchun
+  `figures()` (saqlash) bunga bog'liq emas (yangi Figure'lar yaratadi); testlarda `MainWindow.fill_all_now()` ishlating.
 * **Bundle xavfsizligi:** RF/SVM/XGBoost modellari joblib/pickle — begona manbadagi bundle'ni yuklamang.
 * **`draw_map`** 16 mln pikselli rasterda sekin: ko'rsatish uchun kamaytirilgan (stride) massiv bering.
+* **Tekshirilmagan masshtab.** Yakuniy audit sintetik loyihalarda (<= ~300x300 piksel) o'tkazildi; katta rasterlar (1500x1500+,
+  12+ qatlam) bo'yicha unumdorlik/xotira o'lchovlari avtomatik auditdan o'tmadi (`pipeline.estimate_cost_text` taxminiy).
+  Katta loyihada avval `n_repeats` va `n_bootstrap` ni kamaytirib sinab ko'ring.

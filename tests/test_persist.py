@@ -208,6 +208,19 @@ def test_save_bundle_validation(ctx, tmp_path):
     assert not (tmp_path / "a" / "manifest.json").exists()
 
 
+def test_save_bundle_to_existing_file_path_gives_clear_error(ctx, tmp_path):
+    """Regressiya: mavjud FAYL yo'liga saqlash "[Errno 17] File exists" emas, aniq o'zbekcha xato berishi kerak."""
+    f = tmp_path / "bundle.txt"
+    f.write_text("muhim")
+    with pytest.raises(ValueError, match="papka emas") as ei:
+        save(ctx, f)
+    assert "Errno" not in str(ei.value) and str(f) in str(ei.value) and f.read_text() == "muhim"
+    # yo'l ichidagi qism fayl bo'lsa (fayl/ichki_papka) ham aniq xato
+    with pytest.raises(ValueError, match="papka"):
+        save(ctx, f / "ichki")
+    assert f.read_text() == "muhim" and f.is_file()
+
+
 def test_save_bundle_overwrite_replaces_stale_models(ctx, tmp_path):
     d = tmp_path / "ow"
     save(ctx, d)

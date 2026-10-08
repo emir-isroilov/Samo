@@ -16,7 +16,11 @@ Qoidalar:
     yoki tugashdan keyin hammasi tiklanadi; prognoz tugmasi faqat o'qitish natijasi bo'lsa yoqiladi);
   * slotlar `_guard` bilan o'ralgan: istisno PyQt5 abort'iga olib bormaydi (BUG-01); `main()` global `sys.excepthook` o'rnatadi;
   * dialoglar (`_warn/_info/_show_error/_confirm_*/_ask_directory`) alohida metodlarda - testlarda almashtiriladi;
-  * `tensorflow`/`shap` modul darajasida import qilinmaydi; `pipeline` (cost hint uchun) kechiktirib import qilinadi.
+  * `tensorflow`/`shap` modul darajasida import qilinmaydi; `pipeline` (cost hint uchun) kechiktirib import qilinadi;
+  * natija tab'lari TEMBEL to'ldiriladi (GUI qotmasligi uchun): `on_training_finished` faqat yengil qismlarni (jadval,
+    yorliq) darhol bajaradi; og'ir canvas chizishlari canvas BIRINCHI KO'RSATILGANDA bajariladi va bosqichlarga bo'linadi
+    (chizish -> layout -> rasterlash; orada event loop ishlaydi, `QTimer.singleShot(0)`). Ko'rinmagan tab'lar chizilmaydi
+    (ortiqcha ish yo'q). Testlar/skriptlar uchun `fill_all_now()` (hammasini sinxron chizadi) va `wait_idle()`.
 
 Chiqish - "prospektivlik indeksi" (0-1), haqiqiy ehtimollik emas.
 """
@@ -33,6 +37,7 @@ from functools import partial
 
 import numpy as np
 from PyQt5.QtCore import QEventLoop, QThread, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QGuiApplication
 from PyQt5.QtWidgets import (QAction, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
                              QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
                              QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QSplitter,
@@ -46,18 +51,23 @@ from ..workers import ApplyBundleWorker, ExportWorker, PredictionWorker, Trainin
 from .param_panel import MODEL_TITLES, HyperParamPanel
 from .result_tabs import (INDEX_NOTE, DiagnosticsTab, ImportanceTab, MapTab, ResultsTab, SpatialTab, format_breaks,
                           parse_breaks)
-from .widgets import FolderPicker, LogView, ProgressPanel
+from .widgets import FolderPicker, LogView, ProgressPanel, elide_text
 
 __all__ = ["MainWindow", "main", "install_excepthook", "format_manifest", "scalar_metrics", "WINDOW_TITLE",
-           "TAB_TITLES", "TAB_DATA", "TAB_HYPER", "TAB_DIAG", "TAB_RESULTS", "TAB_SPATIAL", "TAB_IMPORTANCE",
+           "TAB_TITLES", "TAB_TOOLTIPS", "initial_window_size", "TAB_DATA", "TAB_HYPER", "TAB_DIAG", "TAB_RESULTS", "TAB_SPATIAL", "TAB_IMPORTANCE",
            "TAB_MAP", "TAB_MODELS"]
 
 _log = logging.getLogger("mpm.gui.main_window")
 
 WINDOW_TITLE = "MPM ML GUI v2 - Oltin ma'danlashuvi prospektivligini bashoratlash (RF / SVM / XGBoost / CNN / ansambl)"
 TAB_DATA, TAB_HYPER, TAB_DIAG, TAB_RESULTS, TAB_SPATIAL, TAB_IMPORTANCE, TAB_MAP, TAB_MODELS = range(8)
-TAB_TITLES = ("1. Ma'lumotlar va o'qitish", "2. Giperparametrlar", "3. Ma'lumotlar tahlili", "4. Natijalar",
-              "5. Spatial CV diagnostika", "6. Feature importance", "7. Prognoz xarita", "8. Modellar")
+# qisqa sarlavhalar (1024 px kenglikdagi oynada ham to'liq ko'rinsin); to'liq nomlar - tooltip'da
+TAB_TITLES = ("1. Ma'lumotlar", "2. Giperparametrlar", "3. Tahlil", "4. Natijalar", "5. Spatial CV", "6. Importance",
+              "7. Xarita", "8. Modellar")
+TAB_TOOLTIPS = ("1. Ma'lumotlar va o'qitish", "2. Giperparametrlar", "3. Ma'lumotlar tahlili", "4. Natijalar",
+                "5. Spatial CV diagnostika", "6. Feature importance", "7. Prognoz xarita", "8. Modellar")
+MIN_WINDOW_SIZE = (980, 640)
+MAX_WINDOW_SIZE = (1400, 900)
 
 _STRATEGY_TEXT = {"random": "Tasodifiy (random)", "grid": "To'r (grid, jitterli)",
                   "distance_weighted": "Konlardan masofaga proporsional (distance_weighted)"}
@@ -97,8 +107,12 @@ BUNDLE_SECURITY_TEXT = (
     "Bu bundle ishonchli manbadanmi?"
 )
 
+METADATA_NOTE_SHORT = ("Eslatma: o'qitishda TIFF papkasiga metadata.csv shabloni YOZILADI (yo'q bo'lsa); uni to'ldirib, "
+                       "keyingi ishda ishlating.")
 METADATA_NOTE = ("Eslatma: o'qitishda TIFF papkasiga metadata.csv shabloni YOZILADI (yo'q bo'lsa). Uni to'ldirib, "
                  "keyingi ishga tushirishda ishlating (data dictionary uchun).")
+
+ERR_PROGRESS_CHARS = 150           # progress qatoridagi xato matni chegarasi (oshsa '...' qo'shiladi, to'liq matn - tooltip'da)
 
 _ERR_STYLE = "color: #B00020;"
 _NOTE_STYLE = "color: gray;"
@@ -107,6 +121,29 @@ _NOTE_STYLE = "color: gray;"
 # ---------------------------------------------------------------------------
 # Qt'siz yordamchilar (testlanadi)
 # ---------------------------------------------------------------------------
+def initial_window_size(avail_w=None, avail_h=None):
+    """Oyna boshlang'ich o'lchami: min(1400x900, ekran availableGeometry'ning 90%), lekin kamida 980x640.
+    Ekran noma'lum (None) bo'lsa - 1400x900."""
+    try:
+        w = MAX_WINDOW_SIZE[0] if not avail_w else min(MAX_WINDOW_SIZE[0], int(0.9 * float(avail_w)))
+        h = MAX_WINDOW_SIZE[1] if not avail_h else min(MAX_WINDOW_SIZE[1], int(0.9 * float(avail_h)))
+    except (TypeError, ValueError):
+        w, h = MAX_WINDOW_SIZE
+    return max(MIN_WINDOW_SIZE[0], w), max(MIN_WINDOW_SIZE[1], h)
+
+
+def _screen_size():
+    """(kenglik, balandlik) - asosiy ekranning availableGeometry'si; aniqlab bo'lmasa (None, None)."""
+    try:
+        scr = QGuiApplication.primaryScreen()
+        if scr is not None:
+            g = scr.availableGeometry()
+            return g.width(), g.height()
+    except Exception:                                             # noqa: BLE001
+        pass
+    return None, None
+
+
 def _is_scalar(v):
     return isinstance(v, (bool, int, float, np.integer, np.floating, np.bool_))
 
@@ -141,48 +178,78 @@ def _fmt(v, nd=3):
 
 
 def format_manifest(manifest):
-    """Bundle manifest.json -> foydalanuvchiga ko'rsatiladigan o'zbekcha matn (xatoga chidamli)."""
+    """Bundle manifest.json -> foydalanuvchiga ko'rsatiladigan o'zbekcha matn (xatoga chidamli: har bo'lim alohida
+    try/except bilan; buzuq bo'lim '(bo'lim: ko'rsatib bo'lmadi ...)' qatori bilan almashtiriladi, qolganlari saqlanadi)."""
     if not isinstance(manifest, dict):
         return "Manifest o'qib bo'lmadi."
     L = []
-    L.append(f"Yaratilgan (UTC): {manifest.get('created_utc', '?')}   |   mpm versiyasi: {manifest.get('mpm_version', '?')}"
-             f"   |   bundle_version: {manifest.get('bundle_version', '?')}")
-    bands = list(manifest.get("band_names") or [])
-    cats = list(manifest.get("categorical") or [])
-    L.append(f"Band nomlari ({len(bands)}): {', '.join(bands) if bands else '-'}")
-    L.append(f"Kategorik qatlamlar: {', '.join(cats) if cats else 'yo`q'}   |   feature'lar soni: "
-             f"{manifest.get('n_features', '?')}   |   CRS: EPSG:{manifest.get('crs_epsg', '?')}")
-    models = manifest.get("models") or {}
-    L.append("Modellar:")
-    for name in (manifest.get("model_names") or list(models)):
-        info = models.get(name) or {}
-        L.append(f"  - {name}: {info.get('n_draws', '?')} ta fon tanlovi, {info.get('class', '?')} "
-                 f"({info.get('input_kind', '?')}, {info.get('loader', '?')})")
-    hpu = manifest.get("hyperparams_used") or {}
-    if isinstance(hpu, dict) and hpu:
-        L.append("Giperparametrlar (1-fon tanlovi):")
-        for name, val in hpu.items():
-            p = val[0] if isinstance(val, list) and val else val
-            if isinstance(p, dict):
-                L.append(f"  {name}: " + ", ".join(f"{k}={v}" for k, v in p.items()))
-    ms = manifest.get("metrics_summary") or {}
-    if isinstance(ms, dict) and ms:
-        L.append("Metrikalar (o'qitishdagi spatial CV):")
-        for name, m in ms.items():
-            if isinstance(m, dict):
-                ci = ""
-                if m.get("auc_ci95_lo") is not None and m.get("auc_ci95_hi") is not None:
-                    ci = f" (95% CI {_fmt(m.get('auc_ci95_lo'))}-{_fmt(m.get('auc_ci95_hi'))})"
-                L.append(f"  {name}: AUC={_fmt(m.get('auc'))}{ci}, PR-AUC={_fmt(m.get('pr_auc'))}, "
-                         f"BalAcc={_fmt(m.get('balanced_accuracy'))}")
-    if manifest.get("block_size") is not None:
-        L.append(f"Spatial blok o'lchami: {_fmt(manifest.get('block_size'), 0)} m")
-    if manifest.get("notes"):
-        L.append(f"Izoh: {manifest['notes']}")
-    versions = manifest.get("versions") or {}
-    if isinstance(versions, dict) and versions:
-        keys = ("python", "scikit-learn", "xgboost", "tensorflow", "numpy")
-        L.append("Kutubxona versiyalari: " + ", ".join(f"{k} {versions.get(k)}" for k in keys if versions.get(k)))
+
+    def header():
+        L.append(f"Yaratilgan (UTC): {manifest.get('created_utc', '?')}   |   mpm versiyasi: {manifest.get('mpm_version', '?')}"
+                 f"   |   bundle_version: {manifest.get('bundle_version', '?')}")
+
+    def bands_section():
+        bands = [str(b) for b in (manifest.get("band_names") or [])]
+        cats = [str(c) for c in (manifest.get("categorical") or [])]
+        L.append(f"Band nomlari ({len(bands)}): {', '.join(bands) if bands else '-'}")
+        L.append(f"Kategorik qatlamlar: {', '.join(cats) if cats else 'yo`q'}   |   feature'lar soni: "
+                 f"{manifest.get('n_features', '?')}   |   CRS: EPSG:{manifest.get('crs_epsg', '?')}")
+
+    def models_section():
+        models = manifest.get("models") or {}
+        lines = ["Modellar:"]
+        for name in (manifest.get("model_names") or list(models)):
+            info = models.get(name) or {}
+            lines.append(f"  - {name}: {info.get('n_draws', '?')} ta fon tanlovi, {info.get('class', '?')} "
+                         f"({info.get('input_kind', '?')}, {info.get('loader', '?')})")
+        L.extend(lines)
+
+    def hyper_section():
+        hpu = manifest.get("hyperparams_used") or {}
+        if isinstance(hpu, dict) and hpu:
+            lines = ["Giperparametrlar (1-fon tanlovi):"]
+            for name, val in hpu.items():
+                p = val[0] if isinstance(val, list) and val else val
+                if isinstance(p, dict):
+                    lines.append(f"  {name}: " + ", ".join(f"{k}={v}" for k, v in p.items()))
+            L.extend(lines)
+
+    def metrics_section():
+        ms = manifest.get("metrics_summary") or {}
+        if isinstance(ms, dict) and ms:
+            lines = ["Metrikalar (o'qitishdagi spatial CV):"]
+            for name, m in ms.items():
+                if isinstance(m, dict):
+                    ci = ""
+                    if m.get("auc_ci95_lo") is not None and m.get("auc_ci95_hi") is not None:
+                        ci = f" (95% CI {_fmt(m.get('auc_ci95_lo'))}-{_fmt(m.get('auc_ci95_hi'))})"
+                    lines.append(f"  {name}: AUC={_fmt(m.get('auc'))}{ci}, PR-AUC={_fmt(m.get('pr_auc'))}, "
+                                 f"BalAcc={_fmt(m.get('balanced_accuracy'))}")
+            L.extend(lines)
+
+    def block_section():
+        if manifest.get("block_size") is not None:
+            L.append(f"Spatial blok o'lchami: {_fmt(manifest.get('block_size'), 0)} m")
+
+    def notes_section():
+        if manifest.get("notes"):
+            L.append(f"Izoh: {manifest['notes']}")
+
+    def versions_section():
+        versions = manifest.get("versions") or {}
+        if isinstance(versions, dict) and versions:
+            keys = ("python", "scikit-learn", "xgboost", "tensorflow", "numpy")
+            L.append("Kutubxona versiyalari: " + ", ".join(f"{k} {versions.get(k)}" for k in keys if versions.get(k)))
+
+    for title, fn in (("sarlavha", header), ("bandlar", bands_section), ("modellar", models_section),
+                      ("giperparametrlar", hyper_section), ("metrikalar", metrics_section),
+                      ("blok o'lchami", block_section), ("izoh", notes_section), ("versiyalar", versions_section)):
+        n = len(L)
+        try:
+            fn()
+        except Exception as exc:                                  # noqa: BLE001
+            del L[n:]                                             # yarim yozilgan bo'lim qoldiqlari olib tashlanadi
+            L.append(f"({title}: ko'rsatib bo'lmadi - {type(exc).__name__}: {exc})")
     L.append("")
     L.append("Eslatma: manifest faqat ma'lumot uchun o'qildi (modellar hali yuklanmagan). Modellar (joblib/pickle) "
              "'Yangi maydonga qo'llash' paytida yuklanadi - faqat ishonchli manbadagi bundle'ni qo'llang. "
@@ -201,6 +268,12 @@ def _list_tiff_stems(folder):
     except OSError:
         return []
     return [os.path.splitext(n)[0] for n in sorted(names, key=lambda s: (s.lower(), s))]
+
+
+def _folder_key(folder):
+    """Papka yo'li taqqoslash kaliti (normallashtirilgan; bo'sh => None)."""
+    folder = str(folder or "").strip()
+    return os.path.normcase(os.path.abspath(folder)) if folder else None
 
 
 def _available(model):
@@ -291,6 +364,16 @@ class _Combo(QComboBox):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFocusPolicy(Qt.StrongFocus)
+        # uzun matnli elementlar forma qatorini o'ralishga majburlamasin (vertikal joy tejaladi)
+        self.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.setMinimumContentsLength(10)
+
+    def showPopup(self):                                          # noqa: N802
+        try:                                                      # ochilgan ro'yxat eng uzun elementga moslanadi
+            self.view().setMinimumWidth(max(self.width(), self.view().sizeHintForColumn(0) + 28))
+        except Exception:                                         # noqa: BLE001
+            pass
+        super().showPopup()
 
     def wheelEvent(self, event):                                  # noqa: N802
         if self.hasFocus():
@@ -318,7 +401,7 @@ class MainWindow(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle(WINDOW_TITLE)
-        self.resize(1400, 900)
+        self.resize(*initial_window_size(*_screen_size()))
         # --- holat
         self.training_result = None
         self._last_prediction = None            # faqat o'qitish natijasi bo'yicha prognoz (eksportga qo'shiladi)
@@ -329,6 +412,7 @@ class MainWindow(QMainWindow):
         self._job_worker = None
         self._job_kind = None
         self._scan_id = 0
+        self._scan_folder_key = None            # oxirgi skanerlangan TIFF papka (normallashtirilgan): qayta tanlashda tanlov saqlanadi
         self._layers_touched = False
         self._bundle_dir = None
         self._bundle_manifest = None
@@ -363,6 +447,11 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.importance_tab, TAB_TITLES[TAB_IMPORTANCE])
         self.tabs.addTab(self.map_tab, TAB_TITLES[TAB_MAP])
         self.tabs.addTab(self._build_models_tab(), TAB_TITLES[TAB_MODELS])
+        for i, tip in enumerate(TAB_TOOLTIPS):
+            self.tabs.setTabToolTip(i, tip)
+        self.tabs.tabBar().setExpanding(False)
+        self.tabs.tabBar().setElideMode(Qt.ElideNone)
+        self.tabs.tabBar().setStyleSheet("QTabBar::tab { padding: 6px 7px; }")      # 8 ta sarlavha 980 px ga sig'sin
         self.result_tab_widgets = (self.diag_tab, self.results_tab, self.spatial_tab, self.importance_tab, self.map_tab)
         for t in (self.diag_tab, self.spatial_tab, self.importance_tab, self.map_tab):
             self.results_tab.register_figure_source(t)
@@ -381,12 +470,14 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(4, 4, 4, 4)
         splitter = QSplitter(Qt.Vertical)
         splitter.setChildrenCollapsible(False)
+        self.main_splitter = splitter
         root.addWidget(splitter)
 
-        # ---- yuqori: sozlamalar (scroll ichida)
+        # ---- yuqori: sozlamalar (scroll ichida) - ko'proq joy shunga beriladi
         self.settings_widget = QWidget()
         grid = QGridLayout(self.settings_widget)
         grid.setContentsMargins(4, 4, 4, 4)
+        grid.setVerticalSpacing(6)
         grid.addWidget(self._group_inputs(), 0, 0, 1, 2)
         grid.addWidget(self._group_background(), 1, 0)
         grid.addWidget(self._group_cv(), 1, 1)
@@ -401,72 +492,111 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setWidget(self.settings_widget)
+        self.settings_scroll = scroll
         splitter.addWidget(scroll)
 
-        # ---- pastki: boshqaruv, cost hint, progress, log
-        bottom = QWidget()
-        bl = QVBoxLayout(bottom)
-        bl.setContentsMargins(0, 0, 0, 0)
+        # ---- o'rta: boshqaruv tugmalari + progress (doim ko'rinadi, ixcham)
+        controls = QWidget()
+        cl = QVBoxLayout(controls)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(3)
         row = QHBoxLayout()
-        self.btn_train = QPushButton("O'qitish (Train + Cross-Validation)")
-        self.btn_train.setStyleSheet("font-weight: bold; padding: 6px 14px;")
+        self.btn_train = QPushButton("O'qitish (Train + CV)")
+        self.btn_train.setStyleSheet("font-weight: bold; padding: 3px 14px;")
         self.btn_stop = QPushButton("To'xtatish (Stop)")
         self.btn_stop.setToolTip("Hisoblashni hamkorlikda to'xtatadi (joriy qadam tugagach). Taxminan 95% dan keyin "
                                  "o'qitishni to'xtatib bo'lmaydi - u deyarli tugagan bo'ladi.")
-        self.btn_save_cfg = QPushButton("Konfiguratsiyani saqlash (JSON)...")
-        self.btn_load_cfg = QPushButton("Konfiguratsiyani yuklash (JSON)...")
+        self.btn_save_cfg = QPushButton("Konfiguratsiyani saqlash...")
+        self.btn_load_cfg = QPushButton("Konfiguratsiyani yuklash...")
+        self.btn_save_cfg.setToolTip("Barcha sozlamalarni JSON faylga saqlash.")
+        self.btn_load_cfg.setToolTip("Sozlamalarni JSON fayldan yuklash.")
+        self.btn_train.setToolTip("O'qitish: modellar + spatial block cross-validation + importance (sozlamalarga ko'ra).")
         for b in (self.btn_train, self.btn_stop, self.btn_save_cfg, self.btn_load_cfg):
             row.addWidget(b)
         row.addStretch(1)
-        bl.addLayout(row)
+        cl.addLayout(row)
+        self.progress = ProgressPanel()
+        cl.addWidget(self.progress)
+        splitter.addWidget(controls)
+
+        # ---- pastki: log va taxminiy hisob-kitob (yig'iladigan: splitter dastagini pastga torting)
         self.cost_view = QPlainTextEdit()
         self.cost_view.setReadOnly(True)
-        self.cost_view.setMaximumHeight(96)
         self.cost_view.setPlaceholderText("Taxminiy hisob-kitob (sozlamalar o'zgarganda yangilanadi)")
-        bl.addWidget(self.cost_view)
-        self.progress = ProgressPanel()
-        bl.addWidget(self.progress)
-        lrow = QHBoxLayout()
-        lrow.addWidget(QLabel("Log:"))
-        lrow.addStretch(1)
+        self.cost_view.setMinimumHeight(24)
+        self.log_view = LogView()
+        self.log_view.setMinimumHeight(24)
         self.btn_save_log = QPushButton("Logni saqlash...")
         self.btn_clear_log = QPushButton("Logni tozalash")
-        lrow.addWidget(self.btn_save_log)
-        lrow.addWidget(self.btn_clear_log)
-        bl.addLayout(lrow)
-        self.log_view = LogView()
-        self.log_view.setMinimumHeight(110)
-        bl.addWidget(self.log_view, 1)
-        splitter.addWidget(bottom)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([560, 340])
+        corner = QWidget()
+        crow = QHBoxLayout(corner)
+        crow.setContentsMargins(0, 0, 0, 0)
+        crow.setSpacing(4)
+        for b in (self.btn_save_log, self.btn_clear_log):
+            b.setFlat(False)
+            b.setStyleSheet("padding: 1px 8px;")
+            crow.addWidget(b)
+        self.bottom_tabs = QTabWidget()
+        self.bottom_tabs.setDocumentMode(True)
+        self.bottom_tabs.addTab(self.log_view, "Log")
+        self.bottom_tabs.addTab(self.cost_view, "Taxminiy hisob-kitob")
+        self.bottom_tabs.setCornerWidget(corner, Qt.TopRightCorner)
+        splitter.addWidget(self.bottom_tabs)
+
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        splitter.setCollapsible(2, True)
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 0)
+        splitter.setStretchFactor(2, 1)
+        splitter.setSizes([465, 56, 80])
         return tab
 
     def _group_inputs(self):
         box = QGroupBox("Kirish ma'lumotlari (barchasi EPSG:28411 / GK 1942 zone 11 ga avtomatik moslashtiriladi)")
         lay = QVBoxLayout(box)
-        self.picker_tiff = FolderPicker("TIFF qatlamlar papkasi:", label_width=250)
-        self.picker_points = FolderPicker("Musbat nuqtalar (konlar) papkasi (.shp):", label_width=250)
-        self.picker_aoi = FolderPicker("Maydon konturi (AOI) papkasi (.shp):", label_width=250)
-        self.picker_output = FolderPicker("Chiqish papkasi (log, eksport, GeoTIFF):", label_width=250)
-        self.picker_output.setToolTip("Bo'sh bo'lmasa: log fayli (mpm_run_N.log) yoziladi va o'qitish tugagach natijalar "
-                                      "avtomatik eksport qilinadi.")
-        for p in (self.picker_tiff, self.picker_points, self.picker_aoi, self.picker_output):
-            lay.addWidget(p)
-        lay.addWidget(QLabel("Qatlamlar (belgi = kategorik: nearest resample + one-hot; tavsiya avtomatik qo'yiladi):"))
+        lay.setSpacing(3)
+        self.picker_tiff = FolderPicker("TIFF qatlamlar papkasi:", label_width=150)
+        self.picker_points = FolderPicker("Konlar (.shp) papkasi:", label_width=130)
+        self.picker_aoi = FolderPicker("Kontur (AOI, .shp):", label_width=150)
+        self.picker_output = FolderPicker("Chiqish papkasi:", label_width=130)
+        self.picker_tiff.setToolTip("TIFF qatlamlar papkasi: har bir .tif/.tiff fayl - bitta qatlam (fayl nomi = band nomi).")
+        self.picker_points.setToolTip("Musbat nuqtalar (konlar) papkasi (.shp).")
+        self.picker_aoi.setToolTip("Maydon konturi (AOI) papkasi (.shp).")
+        self.picker_output.setToolTip("Chiqish papkasi (log, eksport, GeoTIFF). Bo'sh bo'lmasa: log fayli (mpm_run_N.log) "
+                                      "yoziladi va o'qitish tugagach natijalar avtomatik eksport qilinadi.")
+        pg = QGridLayout()                                        # 2x2: vertikal joy tejaladi
+        pg.setContentsMargins(0, 0, 0, 0)
+        pg.setHorizontalSpacing(14)
+        pg.setVerticalSpacing(3)
+        pg.setColumnStretch(0, 1)
+        pg.setColumnStretch(1, 1)
+        pg.addWidget(self.picker_tiff, 0, 0)
+        pg.addWidget(self.picker_points, 0, 1)
+        pg.addWidget(self.picker_aoi, 1, 0)
+        pg.addWidget(self.picker_output, 1, 1)
+        lay.addLayout(pg)
+        self.layer_summary = _note_label("")
+        self.layer_summary.setWordWrap(False)
+        crow = QHBoxLayout()                                      # sarlavha + xulosa bitta qatorda
+        cap = QLabel("Qatlamlar (belgi = kategorik):")
+        cap.setToolTip("Belgilangan qatlam kategorik: nearest resample + one-hot kodlash. Tavsiya avtomatik qo'yiladi "
+                       "(kerak bo'lmasa belgini olib tashlang).")
+        crow.addWidget(cap)
+        crow.addStretch(1)
+        crow.addWidget(self.layer_summary)
+        lay.addLayout(crow)
         self.layer_list = QListWidget()
-        self.layer_list.setMaximumHeight(96)
+        self.layer_list.setMaximumHeight(72)
+        self.layer_list.setMinimumHeight(44)
         self.layer_list.setToolTip("Belgilanmagan = raqamli qatlam. Kategorik qatlamlar (litologiya, razlom zonasi kodi) "
                                    "bilinear emas, nearest bilan moslanadi va one-hot kodlanadi.")
         lay.addWidget(self.layer_list)
-        self.layer_summary = _note_label("")
-        lay.addWidget(self.layer_summary)
         self.chk_assume_crs = QCheckBox("CRS yozilmagan TIFF/SHP fayllar EPSG:28411 (GK 1942 zone 11) deb qabul qilinsin")
         self.chk_assume_crs.setToolTip("Yoqilgan: CRS metadata yo'q fayllar qayta proyeksiya qilinmaydi, koordinatalari "
                                        "allaqachon EPSG:28411 da deb hisoblanadi.\nO'chirilgan: CRS yo'q fayl uchrasa, xato.")
         lay.addWidget(self.chk_assume_crs)
-        lay.addWidget(_note_label(METADATA_NOTE))
+        self.picker_tiff.setToolTip(self.picker_tiff.toolTip() + "\n\n" + METADATA_NOTE_SHORT)
         return box
 
     def _group_background(self):
@@ -599,12 +729,10 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- tab 2
     def _build_hyper_tab(self):
+        """HyperParamPanel to'g'ridan-to'g'ri (tashqi QScrollArea yo'q): model sahifalari o'z scroll'iga ega, shuning
+        uchun ikki qavat scroll bo'lmaydi; tuning guruhi pastda doim ko'rinadi."""
         self.hyper_panel = HyperParamPanel()
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setWidget(self.hyper_panel)
-        return scroll
+        return self.hyper_panel
 
     # ---------------------------------------------------------------- tab 8
     def _build_models_tab(self):
@@ -634,7 +762,7 @@ class MainWindow(QMainWindow):
         l2.addWidget(self.bundle_path_label)
         self.bundle_info = QPlainTextEdit()
         self.bundle_info.setReadOnly(True)
-        self.bundle_info.setMinimumHeight(190)
+        self.bundle_info.setMinimumHeight(120)
         self.bundle_info.setPlaceholderText("Yuklangan bundle haqida ma'lumot (manifest) shu yerda ko'rinadi.")
         l2.addWidget(self.bundle_info)
         lay.addWidget(g2)
@@ -860,7 +988,17 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _put(widget, value, label, warns):
-        """Spin/double-spin ga qiymat qo'yadi; diapazondan chiqsa ogohlantirish yig'adi."""
+        """Spin/double-spin ga qiymat qo'yadi; diapazondan chiqsa ogohlantirish yig'adi. Qiymat NaN/inf bo'lsa vidjetga
+        TEGILMAYDI (joriy qiymat qoladi) va ogohlantirish yoziladi. Umuman son bo'lmagan qiymat (matn, None) -
+        ValueError (yuklash bekor qilinadi, vidjetlar tiklanadi: `load_config_from`)."""
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"{label}: '{value}' son emas") from None
+        if not np.isfinite(f):
+            warns.append(f"{label}: '{value}' chekli son emas, o'zgartirilmadi")
+            return
+        value = int(f) if isinstance(widget, QSpinBox) else f
         try:
             widget.setValue(value)
         except (TypeError, ValueError, OverflowError):
@@ -892,17 +1030,18 @@ class MainWindow(QMainWindow):
             self._layer_scan_timer.stop()
             self._scan_id += 1                                    # kutilayotgan skanerlash natijalari e'tiborsiz
             self._populate_layers(cfg.tiff_folder, cfg.categorical_layers)
+            self._scan_folder_key = _folder_key(cfg.tiff_folder)
             self._set_variogram(cfg.variogram_band)
             self.chk_assume_crs.setChecked(bool(cfg.assume_crs_if_missing))
-            self._put(self.spin_background, int(cfg.n_background), "Fon nuqtalar soni", warns)
-            self._put(self.spin_min_dist, float(cfg.min_distance), "Min. masofa", warns)
+            self._put(self.spin_background, cfg.n_background, "Fon nuqtalar soni", warns)
+            self._put(self.spin_min_dist, cfg.min_distance, "Min. masofa", warns)
             self._put_combo(self.combo_strategy, cfg.background_strategy, "Fon strategiyasi", warns)
-            self._put(self.spin_final_bg, int(cfg.final_bg_draws), "Yakuniy fon ansambli", warns)
-            self._put(self.spin_kfold, int(cfg.n_splits), "K-fold", warns)
-            self._put(self.spin_repeats, int(cfg.n_repeats), "CV takrorlari", warns)
-            self._put(self.spin_block, float(cfg.block_size), "Blok o'lchami", warns)
+            self._put(self.spin_final_bg, cfg.final_bg_draws, "Yakuniy fon ansambli", warns)
+            self._put(self.spin_kfold, cfg.n_splits, "K-fold", warns)
+            self._put(self.spin_repeats, cfg.n_repeats, "CV takrorlari", warns)
+            self._put(self.spin_block, cfg.block_size, "Blok o'lchami", warns)
             self.chk_random_cv.setChecked(bool(cfg.run_random_cv))
-            self._put(self.spin_bootstrap, int(cfg.n_bootstrap), "Bootstrap soni", warns)
+            self._put(self.spin_bootstrap, cfg.n_bootstrap, "Bootstrap soni", warns)
             um = cfg.use_models if isinstance(cfg.use_models, dict) else {}
             for m, cb in self.model_checks.items():
                 want = bool(um.get(m, False))
@@ -912,16 +1051,16 @@ class MainWindow(QMainWindow):
                 cb.setChecked(want)
             self.chk_calibrate.setChecked(bool(cfg.calibrate))
             self._put_combo(self.combo_cal_method, cfg.calibration_method, "Kalibrlash usuli", warns)
-            self._put(self.spin_cal_cv, int(cfg.calibration_cv), "Kalibrlash CV", warns)
+            self._put(self.spin_cal_cv, cfg.calibration_cv, "Kalibrlash CV", warns)
             self.chk_bg_sens.setChecked(bool(cfg.bg_sensitivity_enabled))
-            self._put(self.spin_bg_draws, int(cfg.bg_sensitivity_draws), "Fon sezgirligi: tanlovlar", warns)
-            self._put(self.spin_bg_repeats, int(cfg.bg_sensitivity_repeats), "Fon sezgirligi: takrorlar", warns)
+            self._put(self.spin_bg_draws, cfg.bg_sensitivity_draws, "Fon sezgirligi: tanlovlar", warns)
+            self._put(self.spin_bg_repeats, cfg.bg_sensitivity_repeats, "Fon sezgirligi: takrorlar", warns)
             self.chk_perm.setChecked(bool(cfg.perm_importance))
-            self._put(self.spin_perm_repeats, int(cfg.perm_importance_repeats), "Permutation takrorlari", warns)
+            self._put(self.spin_perm_repeats, cfg.perm_importance_repeats, "Permutation takrorlari", warns)
             self.chk_shap.setChecked(bool(cfg.shap_enabled))
-            self._put(self.spin_shap_bg, int(cfg.shap_max_background), "SHAP qatorlari", warns)
-            self._put(self.spin_seed, int(cfg.seed), "Seed", warns)
-            self._put(self.spin_jobs, int(cfg.n_jobs), "n_jobs", warns)
+            self._put(self.spin_shap_bg, cfg.shap_max_background, "SHAP qatorlari", warns)
+            self._put(self.spin_seed, cfg.seed, "Seed", warns)
+            self._put(self.spin_jobs, cfg.n_jobs, "n_jobs", warns)
             # giperparametrlar va tuning (panel MERGE qiladi: avval standartga qaytaramiz)
             self.hyper_panel.reset_defaults()
             warns.extend(self.hyper_panel.set_hyperparams(cfg.hyperparams))
@@ -932,10 +1071,17 @@ class MainWindow(QMainWindow):
             # sinflash (7-tab)
             mt = self.map_tab
             self._put_combo(mt.method_combo, cfg.class_method, "Sinflash usuli", warns)
-            self._put(mt.n_classes_spin, int(cfg.n_classes), "Sinflar soni", warns)
+            self._put(mt.n_classes_spin, cfg.n_classes, "Sinflar soni", warns)
             if cfg.class_breaks:
-                mt.breaks_edit.setText(format_breaks(cfg.class_breaks))
-                self._class_breaks_fallback = [float(b) for b in cfg.class_breaks]
+                try:
+                    finite = all(np.isfinite(float(b)) for b in cfg.class_breaks)
+                except (TypeError, ValueError):
+                    finite = False
+                if finite:
+                    mt.breaks_edit.setText(format_breaks(cfg.class_breaks))
+                    self._class_breaks_fallback = [float(b) for b in cfg.class_breaks]
+                else:
+                    warns.append("Sinflash chegaralari: chekli bo'lmagan qiymat bor, o'zgartirilmadi")
         finally:
             self._applying = False
         self._update_dependent_widgets()
@@ -1121,8 +1267,15 @@ class MainWindow(QMainWindow):
         folder = self.picker_tiff.path()
         self._scan_id += 1
         sid = self._scan_id
-        self._populate_layers(folder, [])
-        if not _list_tiff_stems(folder):
+        key = _folder_key(folder)
+        names = _list_tiff_stems(folder)
+        same = key is not None and key == self._scan_folder_key
+        keep = [c for c in self._checked_layers() if c in names] if same else []     # bir xil papka: tanlov saqlanadi
+        touched = bool(self._layers_touched) if same else False
+        self._populate_layers(folder, keep)
+        self._layers_touched = touched
+        self._scan_folder_key = key
+        if not names:
             if folder:
                 self.layer_summary.setText("Bu papkada .tif/.tiff fayllar topilmadi.")
             return
@@ -1303,11 +1456,16 @@ class MainWindow(QMainWindow):
         self.last_job_error = head
         self.log(f"XATO [{kind}]: {head}")
         self.log(text)
-        self.progress.stopped("Xato: " + head.splitlines()[0][:150])
-        self._status("Xato: " + head.splitlines()[0][:150])
+        first = head.splitlines()[0]
+        short = elide_text("Xato: " + first, ERR_PROGRESS_CHARS)
+        self._status(short)
         if kind == "autoexport":
+            # muvaffaqiyatli o'qitishning "Tayyor" holati ustiga yozilmaydi: faqat log + status
+            self.progress.stage_label.setText("Tayyor")
+            self.progress.stage_label.setToolTip("")
             self.log("Avtomatik eksport o'tkazib yuborildi (xato yuqorida). 'Natijalarni eksport' tugmasi bilan qayta urining.")
             return
+        self.progress.stopped(short, tooltip="Xato: " + head)
         title = _JOBS.get(kind, ("Xato", False))[0]
         self._show_error(title, head, detail=text)
 
@@ -1333,7 +1491,18 @@ class MainWindow(QMainWindow):
         worker = TrainingWorker(cfg)
         self._begin_job("train", worker)
         self.tabs.setCurrentIndex(TAB_DATA)
+        self._ensure_log_height()
         return worker
+
+    def _ensure_log_height(self, want=150):
+        """O'qitish boshlanganda log paneli juda past bo'lsa kattalashtiradi (sozlamalar ish paytida o'chiq, joy shundan olinadi)."""
+        try:
+            sizes = self.main_splitter.sizes()
+            if len(sizes) == 3 and sizes[2] < want and sizes[0] > 200:
+                delta = min(want - sizes[2], sizes[0] - 200)
+                self.main_splitter.setSizes([sizes[0] - delta, sizes[1], sizes[2] + delta])
+        except Exception:                                         # noqa: BLE001
+            pass
 
     def _step(self, name, fn, *args):
         """Bitta tab'ni to'ldirish: istisno qolgan tab'larni to'xtatmaydi (logga yoziladi)."""
@@ -1345,13 +1514,47 @@ class MainWindow(QMainWindow):
             self.log(f"XATO: '{name}' tab'ini to'ldirib bo'lmadi: {type(exc).__name__}: {exc}")
             return False
 
+    # ---- tembel to'ldirish (GUI qotmasligi uchun)
+    def _lazy_step(self, tab, name, fn, *args):
+        """`_step` + tab'ning og'ir canvas chizishlari kechiktiriladi (tab.lazy_fill)."""
+        tab.lazy_fill = True
+        try:
+            return self._step(name, fn, *args)
+        finally:
+            tab.lazy_fill = False
+
     def _fill_tabs(self, result):
-        self._step("Ma'lumotlar tahlili", self.diag_tab.set_diagnostics, result.get("diagnostics"),
-                   result.get("data_dictionary"))
-        self._step("Natijalar", self.results_tab.set_result, result)
-        self._step("Spatial CV diagnostika", self.spatial_tab.set_result, result)
-        self._step("Feature importance", self.importance_tab.set_result, result)
-        self._step("Prognoz xarita", self.map_tab.set_result, result)
+        """Natijani tab'larga topshiradi: yengil qismlar (jadval, yorliq) darhol, og'ir canvas'lar kechiktiriladi
+        (canvas birinchi ko'rsatilganda bosqichma-bosqich chiziladi; orada event loop ishlaydi)."""
+        self._lazy_step(self.diag_tab, "Ma'lumotlar tahlili", lambda: self.diag_tab.set_diagnostics(
+            result.get("diagnostics"), result.get("data_dictionary")))
+        self._lazy_step(self.results_tab, "Natijalar", lambda: self.results_tab.set_result(result))
+        self._lazy_step(self.spatial_tab, "Spatial CV diagnostika", lambda: self.spatial_tab.set_result(result))
+        self._lazy_step(self.importance_tab, "Feature importance", lambda: self.importance_tab.set_result(result))
+        self._lazy_step(self.map_tab, "Prognoz xarita", lambda: self.map_tab.set_result(result))
+
+    @staticmethod
+    def _tab_count(tab, name):
+        try:
+            return int(getattr(tab, name)())
+        except Exception:                                         # noqa: BLE001
+            return 0
+
+    def fill_pending(self):
+        """Hozir ko'rinib turgan canvas'lar orasida chizilishi tugamaganlari bormi (ko'rinmagan tab'larning
+        kechiktirilgan canvas'lari hisobga olinmaydi: ular tab ochilganda chiziladi)."""
+        return any(self._tab_count(t, "visible_pending_count") for t in self.result_tab_widgets)
+
+    def fill_all_now(self):
+        """Barcha kechiktirilgan chizishlarni (ko'rinmaganlarini ham) SINXRON bajaradi (testlar/skriptlar/saqlashdan
+        oldin). Bajarilgan canvas'lar soni."""
+        n = 0
+        for t in self.result_tab_widgets:
+            try:
+                n += int(t.flush())
+            except Exception as exc:                              # noqa: BLE001
+                _log.warning("fill_all_now xatosi: %s", exc, exc_info=True)
+        return n
 
     @staticmethod
     def _result_summary(result):
@@ -1429,7 +1632,7 @@ class MainWindow(QMainWindow):
         if isinstance(pred, dict):
             for p in pred.get("saved_paths") or []:
                 self.log(f"  Saqlandi: {p}")
-        self._step("Prognoz xarita", self.map_tab.set_prediction, pred)
+        self._lazy_step(self.map_tab, "Prognoz xarita", self.map_tab.set_prediction, pred)
         self.tabs.setCurrentIndex(TAB_MAP)
 
     # ======================================================================
@@ -1503,8 +1706,8 @@ class MainWindow(QMainWindow):
 
     def on_diagnostics_finished(self, out):
         self.progress.finish("Tahlil tayyor")
-        self._step("Ma'lumotlar tahlili", self.diag_tab.set_diagnostics, (out or {}).get("diagnostics"),
-                   (out or {}).get("data_dictionary"))
+        self._lazy_step(self.diag_tab, "Ma'lumotlar tahlili", self.diag_tab.set_diagnostics,
+                        (out or {}).get("diagnostics"), (out or {}).get("data_dictionary"))
         self.log("Ma'lumotlar tahlili tayyor (qo'lda metadata to'ldirilmagan: o'qitishda metadata.csv ishlatiladi).")
         self.tabs.setCurrentIndex(TAB_DIAG)
 
@@ -1564,6 +1767,12 @@ class MainWindow(QMainWindow):
             m = json.load(f)
         if not isinstance(m, dict) or "bundle_version" not in m:
             raise ValueError("manifest.json MPM bundle manifest'i emas (bundle_version yo'q).")
+        for key, typ, what in (("band_names", (list, tuple), "ro'yxat"), ("categorical", (list, tuple), "ro'yxat"),
+                               ("model_names", (list, tuple), "ro'yxat"), ("models", dict, "lug'at"),
+                               ("hyperparams_used", dict, "lug'at"), ("metrics_summary", dict, "lug'at"),
+                               ("versions", dict, "lug'at")):
+            if m.get(key) is not None and not isinstance(m[key], typ):
+                raise ValueError(f"manifest.json buzuq: '{key}' {what} bo'lishi kerak.")
         return m
 
     def _select_bundle(self, path):
@@ -1633,7 +1842,7 @@ class MainWindow(QMainWindow):
             ign = out.get("ignored_files") or []
             if ign:
                 self.log(f"  Ortiqcha TIFF'lar e'tiborsiz qoldirildi: {len(ign)} ta")
-        self._step("Prognoz xarita", self.map_tab.set_prediction, out)
+        self._lazy_step(self.map_tab, "Prognoz xarita", self.map_tab.set_prediction, out)
         self.log("Bundle yangi maydonga qo'llandi (7-tabda). Success-rate/Konlar_* ustunlari yo'q: yangi maydonda konlar noma'lum.")
         self.tabs.setCurrentIndex(TAB_MAP)
 
@@ -1655,17 +1864,20 @@ class MainWindow(QMainWindow):
         timer.setInterval(15)
         state = {"left": int(timeout_ms)}
 
+        def idle():
+            return not self._busy and not _THREAD_KEEPER and not self.fill_pending()
+
         def tick():
             state["left"] -= 15
-            if (not self._busy and not _THREAD_KEEPER) or state["left"] <= 0:
+            if idle() or state["left"] <= 0:
                 loop.quit()
         timer.timeout.connect(tick)
         timer.start()
-        if self._busy or _THREAD_KEEPER:
+        if not idle():
             loop.exec_()
         timer.stop()
         QApplication.processEvents()
-        return not self._busy and not _THREAD_KEEPER
+        return idle()
 
     def _shutdown_threads(self, timeout_ms=30000):
         """Barcha ishchilarni bekor qiladi va tugashini kutadi. True = hammasi to'xtadi."""

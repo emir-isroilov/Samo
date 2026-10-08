@@ -925,6 +925,7 @@ def test_manual_metadata_and_dictionary(raster, tmp_path):
     manual, path = D.load_or_create_manual_metadata(folder, raster.band_names, log_fn=log)
     assert os.path.isfile(path) and path.endswith("metadata.csv") and all(v == {} for v in manual.values())
     assert any("shablon" in m for m in msgs)
+    assert any("KIRISH TIFF papkasiga" in m and path in m for m in msgs)          # yon ta'sir log'da aniq aytilgan
     tpl = pd.read_csv(path, dtype=str, keep_default_na=False)
     assert tpl["band_name"].tolist() == raster.band_names and list(tpl.columns) == D.MANUAL_METADATA_FIELDS
     tpl.loc[0, "source_owner"] = "Geologiya xizmati"
@@ -948,12 +949,44 @@ def test_manual_metadata_never_overwrites_existing_file(tmp_path):
     msgs, log = _collect_log()
     manual, _ = D.load_or_create_manual_metadata(str(tmp_path), ["a", "b"], log_fn=log)
     assert manual == {"a": {}, "b": {}} and path.read_bytes() == junk and any("o'qib bo'lmadi" in m for m in msgs)
+    junk2 = b"\xff\xfe garbage \x81\n\x01\x02"                  # NUL yo'q: cp1251 bilan "o'qiladi", lekin jadval emas
+    path.write_bytes(junk2)
+    msgs.clear()
+    manual, _ = D.load_or_create_manual_metadata(str(tmp_path), ["a", "b"], log_fn=log)
+    assert manual == {"a": {}, "b": {}} and path.read_bytes() == junk2 and any("OGOHLANTIRISH" in m for m in msgs)
+    path.write_bytes(b"")
+    msgs.clear()
+    manual, _ = D.load_or_create_manual_metadata(str(tmp_path), ["a"], log_fn=log)
+    assert manual == {"a": {}} and path.read_bytes() == b"" and any("o'qib bo'lmadi" in m for m in msgs)
     path.write_text("x,y\n1,2\n", encoding="utf-8")
     manual, _ = D.load_or_create_manual_metadata(str(tmp_path), ["a"], log_fn=log)
     assert manual == {"a": {}} and path.read_text(encoding="utf-8") == "x,y\n1,2\n"
     path.write_text("band_name,notes\na,birinchi\na,ikkinchi\n b ,xx\n", encoding="utf-8")
     manual, _ = D.load_or_create_manual_metadata(str(tmp_path), ["a", "b", "c"], log_fn=log)
     assert manual["a"]["notes"] == "birinchi" and manual["b"]["notes"] == "xx" and manual["c"] == {}
+
+
+@pytest.mark.parametrize("encoding, sep, owner", [
+    ("cp1251", ";", "Институт геологии"),          # rus Excel: ';' + cp1251
+    ("utf-8-sig", ";", "Geologiya xizmati"),         # ';' + UTF-8 BOM
+    ("utf-8", ",", "Oʻzbekgeologiya"),                # oddiy UTF-8 (BOM'siz)
+    ("cp1252", ";", "Servicio Geológico"),           # g'arbiy Excel: ';' + cp1252
+    ("cp1251", ",", "Институт"),                     # vergul + cp1251
+])
+def test_manual_metadata_autodetects_delimiter_and_encoding(tmp_path, encoding, sep, owner):
+    """Regressiya: Excel mintaqaviy sozlamasi (';' va cp1251/cp1252) metadata.csv'ni jim bo'sh qilib yubormasin."""
+    path = tmp_path / "metadata.csv"
+    text = sep.join(["band_name", "source_owner", "survey_date"]) + "\n" + sep.join(["layer1", owner, "2020"]) \
+        + "\n" + sep.join(["layer2", "", "2021"]) + "\n"
+    path.write_bytes(text.encode(encoding))
+    before = path.read_bytes()
+    msgs, log = _collect_log()
+    manual, p = D.load_or_create_manual_metadata(str(tmp_path), ["layer1", "layer2", "layer3"], log_fn=log)
+    assert manual["layer1"]["source_owner"] == owner and manual["layer1"]["survey_date"] == "2020"
+    assert manual["layer2"]["survey_date"] == "2021" and manual["layer3"] == {}
+    assert path.read_bytes() == before and not any("OGOHLANTIRISH" in m and "o'qib" in m for m in msgs)
+    if sep == ";" or encoding.startswith("cp"):
+        assert any("avtomatik aniqlandi" in m for m in msgs)
 
 
 # ---------------------------------------------------------------------------

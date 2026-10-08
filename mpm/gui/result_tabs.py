@@ -12,8 +12,15 @@ chizish/jadval xatosi slotni qulatmaydi (BUG-01) - xato `last_error` va tab ichi
                                                    predict_requested(dict) export_requested()
 
 Barcha tab'larda: `set_busy(bool)` (tugmalarni o'chirish), `has_result()`, `last_error`, signal `message(str)` (log uchun:
-fayl saqlandi/xato). Tab'lar QScrollArea ichida: canvas kamida ~6x4.5 dyuym (kichik oynada constrained_layout
-ogohlantirishi bo'lmasligi uchun). Chiqish - "prospektivlik indeksi" (ehtimollik emas).
+fayl saqlandi/xato). Tab'lar QScrollArea ichida, lekin canvas'lar kichik minimal o'lchamli (~5x3 dyuym) va bo'sh joyni
+to'ldiradi: odatdagi oynada (1024x700) alohida aylantirish (scroll) kerak bo'lmaydi; juda kichik oynada yagona scroll
+chiqadi. Chiqish - "prospektivlik indeksi" (ehtimollik emas).
+
+Kechiktirilgan (lazy) chizish (GUI qotmasligi uchun): `tab.lazy_fill = True` bo'lganda `set_result`/`set_prediction`
+faqat yengil qismlarni (jadval, yorliq) darhol bajaradi, og'ir canvas chizishlari esa canvas birinchi ko'rsatilganda
+(bosqichma-bosqich: chizish -> layout -> rasterlash, orada event loop ishlaydi) yoki `flush_one()` / `flush()`
+chaqirilganda bajariladi (`pending_count()` - kutayotganlar soni). Standart (`lazy_fill=False`) - hammasi darhol
+(sinxron), shuning uchun mavjud chaqiruvlar o'zgarmaydi.
 """
 from __future__ import annotations
 
@@ -26,15 +33,15 @@ import re
 import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFrame, QGroupBox,
-                             QHBoxLayout, QLabel, QLineEdit, QListWidget, QPushButton, QScrollArea, QSpinBox,
-                             QStackedWidget, QTabWidget, QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                             QPushButton, QScrollArea, QSizePolicy, QSpinBox, QStackedWidget, QTabWidget,
+                             QToolButton, QVBoxLayout, QWidget)
 
 from ..common import ENSEMBLE_NAME
 from . import plots
-from .widgets import DataFrameTable, FolderPicker, MplCanvas
+from .widgets import PHASE_PAUSE_MS, DataFrameTable, FolderPicker, MplCanvas
 
 __all__ = ["DiagnosticsTab", "ResultsTab", "SpatialTab", "ImportanceTab", "MapTab", "EMPTY_TEXT", "INDEX_NOTE",
            "parse_breaks", "format_breaks", "downsample_map", "tuning_dataframe", "importance_dataframe",
@@ -46,6 +53,8 @@ EMPTY_TEXT = "Hali natija yo'q"
 INDEX_NOTE = "Chiqish - prospektivlik indeksi (0-1), haqiqiy ehtimollik emas: fon nisbati sun'iy"
 CNN_NOTE = ("CNN chiqishi kalibrlanmaydi va neg/pos namuna og'irligi bilan o'qitiladi, ansambl esa oddiy o'rtacha: "
             "CNN qiymatlari boshqa modellar bilan bir shkalada bo'lmasligi mumkin.")
+STD_NOTE = ("1 takror: std aniqlanmagan (AUC_std ustuni bo'sh) - bitta CV takrorida o'zgaruvchanlikni baholab bo'lmaydi; "
+            "ishonchli std uchun 'CV takrorlash soni' ni 2 va undan ko'p qiling.")
 CI_NOTE = ("AUC - CV takrorlari o'rtachasi; 95% CI - o'rtacha OOF bashorat ustida blok-bootstrap, shuning uchun nuqtaviy "
            "AUC CI chetida yoki undan tashqarida chiqishi mumkin (xato emas). Sens/Spec - Youden bo'sag'ida.")
 MAP_MAX_PX_SHOW = 2500                  # ekranda ko'rsatish uchun xarita tomoni (stride bilan kamaytiriladi)
@@ -287,10 +296,39 @@ def _new_fig(figsize=(8.0, 6.0)):
 # ---------------------------------------------------------------------------
 # Vidjet yordamchilari
 # ---------------------------------------------------------------------------
-def _canvas(min_w=640, min_h=460, figsize=(6.4, 4.8)):
+class _FlatVBox(QVBoxLayout):
+    """Tab tanasi (QScrollArea ichidagi) layout'i: `heightForWidth` ishlatilmaydi. Aks holda ichidagi ko'rinadigan
+    o'raluvchi (word-wrap) yorliq tufayli QScrollArea tana balandligini minimal emas, sizeHint'lar yig'indisi bo'yicha
+    hisoblab, keraksiz scroll ochadi (canvas pastki qismi ko'rinmay qolardi)."""
+
+    def hasHeightForWidth(self):                             # noqa: N802
+        return False
+
+    def heightForWidth(self, width):                         # noqa: N802
+        return -1
+
+    def minimumHeightForWidth(self, width):                  # noqa: N802
+        return -1
+
+
+class _Tabs(QTabWidget):
+    """QTabWidget, sahifalaridagi o'raluvchi (word-wrap) yorliqlar sabab `heightForWidth` ni yuqoriga uzatmaydi:
+    aks holda tashqi QScrollArea tana balandligini minimal emas, sizeHint bo'yicha hisoblab, keraksiz scroll ochadi
+    (canvas pastki qismi ko'rinmay qolardi)."""
+
+    def hasHeightForWidth(self):                             # noqa: N802
+        return False
+
+    def heightForWidth(self, width):                         # noqa: N802
+        return -1
+
+
+def _canvas(min_w=480, min_h=240, figsize=(6.4, 4.8)):
+    """Canvas: minimal o'lcham kichik (kichik oynada ham sig'sin), katta oynada bo'sh joyni to'ldiradi."""
     c = MplCanvas(figsize=figsize)
     c.canvas.setMinimumSize(int(min_w), int(min_h))
     c.setMinimumSize(int(min_w), int(min_h) + 36)
+    c.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
     return c
 
 
@@ -315,9 +353,24 @@ def _draw(c, fn, *args, **kw):
     c.redraw()
 
 
-def _table(min_h=170):
+def _draw_async(c, fn, *args, **kw):
+    """`_draw` ning kechiktirilgan varianti: grafik chiziladi (artist'lar yaratiladi), RASTERLASH esa canvas'ning o'z
+    bosqichli `draw_idle()` ida (layout -> rasterlash; orada event loop ishlaydi) bajariladi."""
+    try:
+        fn(c.fig, *args, **kw)
+    except Exception as exc:                                 # noqa: BLE001
+        _log.warning("%s xato: %s: %s", getattr(fn, "__name__", fn), type(exc).__name__, exc, exc_info=True)
+        try:
+            plots.no_data(c.fig, detail=f"Chizishda xato: {type(exc).__name__}: {exc}")
+        except Exception:                                    # noqa: BLE001
+            pass
+    c.canvas.draw_idle()
+
+
+def _table(min_h=90):
+    """Jadval: minimal balandlik kichik (kichik oynada scroll chiqmasin); bo'sh joy bo'lsa jadval kengayadi."""
     t = DataFrameTable()
-    t.setMinimumHeight(int(min_h))
+    t.setMinimumHeight(int(min(min_h, 100)))
     return t
 
 
@@ -327,6 +380,33 @@ def _note(text="", wrap=True):
     lb.setStyleSheet(_GRAY)
     lb.setTextInteractionFlags(Qt.TextSelectableByMouse)
     return lb
+
+
+class _NoteBox(QWidget):
+    """Uzun izoh: sarlavha tugmasi bilan yig'iladi (standart - yig'ilgan): header/body joyi tejaladi, matn esa
+    `label` (QLabel) da saqlanadi (`label.setText(...)` odatdagidek ishlaydi)."""
+
+    def __init__(self, text="", title="Izoh va eslatmalar", expanded=False, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self.button = QToolButton()
+        self.button.setText(title)
+        self.button.setCheckable(True)
+        self.button.setAutoRaise(True)
+        self.button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.button.setStyleSheet(_GRAY)
+        self.label = _note(text)
+        lay.addWidget(self.button, 0, Qt.AlignLeft)
+        lay.addWidget(self.label)
+        self.button.toggled.connect(self._on_toggled)
+        self.button.setChecked(bool(expanded))
+        self._on_toggled(bool(expanded))
+
+    def _on_toggled(self, on):
+        self.button.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
+        self.label.setVisible(bool(on))
 
 
 def _title(text):
@@ -398,9 +478,20 @@ class _TabBase(QWidget):
         self._result = None
         self._errors = []
         self.last_error = None
+        self.lazy_fill = False                    # True: og'ir canvas chizishlari kechiktiriladi (modul docstring'iga qarang)
+        self._deferred = {}                       # canvas -> thunk (qo'shilish tartibida)
+        self._async_ok = False                    # kechiktirilgan chizish ichida True: rasterlash bosqichli (draw_idle)
+        self._filtered = set()                    # Show hodisasi kuzatiladigan canvas'lar
+        self._show_queue = []
+        self._show_timer = QTimer(self)
+        self._show_timer.setSingleShot(True)
+        self._show_timer.setInterval(PHASE_PAUSE_MS)
+        self._show_timer.timeout.connect(self._drain_show_queue)
         root = QVBoxLayout(self)
-        root.setContentsMargins(6, 6, 6, 6)
+        root.setContentsMargins(6, 4, 6, 4)
+        root.setSpacing(3)
         self.header = QVBoxLayout()
+        self.header.setSpacing(3)
         root.addLayout(self.header)
         self.error_label = QLabel("")
         self.error_label.setWordWrap(True)
@@ -426,7 +517,7 @@ class _TabBase(QWidget):
         pl.addStretch(2)
         # natija (scroll ichida)
         self.body = QWidget()
-        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout = _FlatVBox(self.body)
         self.body_layout.setContentsMargins(0, 0, 0, 0)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -457,8 +548,106 @@ class _TabBase(QWidget):
     def _refresh_buttons(self):
         """Voris sinflar tugmalar holatini shu yerda yangilaydi."""
 
+    # ---- kechiktirilgan chizish
+    def _paint_later(self, canvas, thunk):
+        """`thunk()` (canvas'ga chizadi) ni bajaradi: `lazy_fill` bo'lmasa darhol, aks holda canvas ko'rsatilganda
+        yoki `flush_one()/flush()` da. Bitta canvas uchun oxirgi so'rov saqlanadi."""
+        if not self.lazy_fill:
+            self._deferred.pop(canvas, None)
+            thunk()
+            return
+        self._deferred.pop(canvas, None)          # tartib: eng yangi so'rov oxirida
+        self._deferred[canvas] = thunk
+        if canvas not in self._filtered:
+            self._filtered.add(canvas)
+            canvas.installEventFilter(self)
+        if canvas.isVisible():
+            self._queue_show(canvas)
+
+    def _render(self, canvas, fn, *args, **kw):
+        """Chizish: kechiktirilgan (ko'rsatilganda) bajarilayotgan bo'lsa - bosqichli (`_draw_async`), aks holda
+        sinxron `_draw` (foydalanuvchi harakati, testlar, `flush`)."""
+        (_draw_async if self._async_ok else _draw)(canvas, fn, *args, **kw)
+
+    def _paint(self, canvas, fn, *args, **kw):
+        """`_draw(canvas, fn, ...)` ning kechiktirilishi mumkin varianti: darhol (lazy_fill=False) yoki canvas
+        ko'rsatilganda bosqichma-bosqich (chizish -> layout -> rasterlash, orada event loop ishlaydi)."""
+        self._paint_later(canvas, lambda: self._render(canvas, fn, *args, **kw))
+
+    def _queue_show(self, canvas):
+        if canvas not in self._show_queue:
+            self._show_queue.append(canvas)
+        self._show_timer.start()
+
+    def eventFilter(self, obj, event):                       # noqa: N802
+        try:
+            if event.type() == QEvent.Show and obj in self._deferred:
+                self._queue_show(obj)
+        except Exception:                                    # noqa: BLE001
+            pass
+        return False
+
+    def _drain_show_queue(self):
+        """Ko'rsatilgan (ko'rinadigan) canvas'larni chizadi: bitta tab'da odatda 1-2 ta canvas ko'rinadi."""
+        queue, self._show_queue = self._show_queue, []
+        for c in queue:
+            self._run_deferred(c, sync=False)
+
+    def _run_deferred(self, canvas, sync=True):
+        """Canvas uchun kutayotgan chizishni bajaradi. `sync=False` (ko'rsatilganda): rasterlash canvas'ning bosqichli
+        `draw_idle()` iga qoldiriladi; `sync=True` (flush): hammasi shu yerda tugaydi. Bajarilgan bo'lsa True."""
+        thunk = self._deferred.pop(canvas, None)
+        if thunk is None:
+            return False
+        self._async_ok = not sync
+        try:
+            thunk()
+        except RuntimeError:                                 # vidjet o'chirilgan (oyna yopilgan)
+            return False
+        except Exception as exc:                             # noqa: BLE001
+            _log.warning("%s: kechiktirilgan chizishda xato: %s: %s", type(self).__name__, type(exc).__name__, exc,
+                         exc_info=True)
+        finally:
+            self._async_ok = False
+        return True
+
+    def pending_count(self):
+        """Hali chizilmagan (kechiktirilgan) canvas'lar soni."""
+        return len(self._deferred)
+
+    def visible_pending_count(self):
+        """Kechiktirilgan canvas'lardan hozir KO'RINIB turganlari (ularning chizilishi tez orada tugaydi); ko'rinmagan
+        tab'lardagilar tab ochilganda chiziladi va bu yerda sanalmaydi."""
+        n = 0
+        for c in list(self._deferred):
+            try:
+                n += 1 if c.isVisible() else 0
+            except RuntimeError:
+                pass
+        for c in list(self._filtered):                       # bosqichli rasterlash hali tugamagan canvas'lar
+            try:
+                n += 1 if getattr(c.canvas, "_pp_busy", False) else 0
+            except RuntimeError:
+                pass
+        return n + (1 if self._show_timer.isActive() else 0)
+
+    def flush_one(self):
+        """Kutayotgan eng birinchi canvas'ni sinxron chizadi. Qolgan kutayotganlar sonini qaytaradi."""
+        if self._deferred:
+            self._run_deferred(next(iter(self._deferred)), sync=True)
+        return len(self._deferred)
+
+    def flush(self):
+        """Barcha kutayotgan chizishlarni sinxron bajaradi (testlar/saqlash uchun). Bajarilganlar sonini qaytaradi."""
+        n = 0
+        while self._deferred:
+            n += 1 if self._run_deferred(next(iter(self._deferred)), sync=True) else 0
+        return n
+
     # ---- xatolar
     def _begin(self):
+        self._deferred.clear()
+        self._show_queue = []
         self._errors = []
         self.last_error = None
         self.error_label.setText("")
@@ -479,12 +668,18 @@ class _TabBase(QWidget):
             self._errors = []
 
     def _fail(self, text, prefix="Xato: "):
+        self._err_prefix = prefix
         self.last_error = str(text)
         self.error_label.setText(prefix + str(text))
         self.error_label.show()
         self.message.emit(prefix + str(text))
 
     def _info(self, text):
+        # oldingi slot (masalan saqlash) xatosi keyingi muvaffaqiyatli amaldan keyin ko'rinib qolmasin
+        if getattr(self, "_err_prefix", None) == "Xato: " and self.last_error:
+            self.last_error = None
+            self.error_label.setText("")
+            self.error_label.hide()
         self.message.emit(str(text))
 
     def figures(self):
@@ -515,15 +710,15 @@ class DiagnosticsTab(_TabBase):
         self.summary_label = QLabel("")
         self.summary_label.setWordWrap(True)
         self.summary_label.hide()
-        self.body_layout.addWidget(self.summary_label)
-        self.tabs = QTabWidget()
+        self.header.addWidget(self.summary_label)               # sarlavhada: o'raluvchi matn scroll hisobini buzmasin
+        self.tabs = _Tabs()
         self.body_layout.addWidget(self.tabs, 1)
 
         self.stats_table = _table(220)
         self.tabs.addTab(_page(_note("valid_pct - qatlam bo'yicha yaroqli piksellar ulushi (barcha qatlamlar "
                                      "kesishmasi shundan ham kichik bo'lishi mumkin). kind: raqamli/kategorik."),
                                self.stats_table), "Qatlam statistikasi")
-        self.corr_canvas = _canvas(620, 540, (6.4, 5.4))
+        self.corr_canvas = _canvas(420, 320, (6.4, 5.4))
         self.corr_note = _note("")
         self.tabs.addTab(_page(self.corr_note, self.corr_canvas), "Korrelyatsiya")
         self.vif_table = _table(220)
@@ -579,7 +774,7 @@ class DiagnosticsTab(_TabBase):
             v = diag.get(key)
             return v if isinstance(v, pd.DataFrame) else None
 
-        self._step("qatlam statistikasi", self.stats_table.set_dataframe, df("layer_stats"))
+        self._step("qatlam statistikasi", self.stats_table.set_dataframe, df("layer_stats"), "{:.6g}")
         self._step("VIF", self.vif_table.set_dataframe, df("vif"), "{:.2f}")
         self._step("VIF rangi", self._color_vif, self.vif_table)
         pairs = df("high_corr_pairs")
@@ -599,7 +794,7 @@ class DiagnosticsTab(_TabBase):
         if corr is None:
             _blank(self.corr_canvas, detail="Korrelyatsiya matritsasi hisoblanmagan.")
         else:
-            self._step("korrelyatsiya", _draw, self.corr_canvas, plots.draw_corr_heatmap, corr)
+            self._step("korrelyatsiya", self._paint, self.corr_canvas, plots.draw_corr_heatmap, corr)
         summ = diag.get("dataset_summary")
         if isinstance(summ, dict):
             txt = (f"Dataset: {summ.get('n', '?')} nuqta ({summ.get('n_pos', '?')} musbat + {summ.get('n_neg', '?')} fon), "
@@ -645,32 +840,38 @@ class ResultsTab(_TabBase):
     def __init__(self, parent=None):
         super().__init__(parent, hint="Modelni o'qitgandan so'ng metrikalar va grafiklar shu yerda ko'rinadi.")
         self._sources = []                                   # figures() beruvchi boshqa tab'lar (saqlash uchun)
-        row = QHBoxLayout()
+        row = QHBoxLayout()                                  # bitta ixcham qator (vertikal joy tejaladi)
         row.addWidget(QLabel("CV rejimi:"))
         self.mode_combo = QComboBox()
         for key, text in _MODES:
             self.mode_combo.addItem(text, key)
         self.mode_combo.currentIndexChanged.connect(lambda _i=0: self._on_mode_changed())
         row.addWidget(self.mode_combo)
-        row.addStretch(1)
-        self.header.addLayout(row)
-        row2 = QHBoxLayout()
-        self.btn_table = QPushButton("Jadvalni CSV/XLSX ga saqlash")
-        self.btn_figs = QPushButton("Barcha grafiklarni saqlash (PNG+PDF)")
-        self.btn_export = QPushButton("Natijalarni eksport (CSV/JSON/XLSX)")
+        self.btn_table = QPushButton("Jadvalni saqlash")
+        self.btn_figs = QPushButton("Grafiklarni saqlash")
+        self.btn_export = QPushButton("Eksport (CSV/JSON/XLSX)")
+        self.btn_table.setToolTip("Metrikalar jadvalini CSV yoki XLSX ga saqlash.")
+        self.btn_figs.setToolTip("Barcha grafiklarni (barcha tab'lardan) PNG va PDF qilib saqlash.")
+        self.btn_export.setToolTip("Natijalarni eksport (CSV/JSON/XLSX): metrikalar, importance, sozlamalar, xulosa.")
         self.btn_table.clicked.connect(lambda _=False: self._on_save_table())
         self.btn_figs.clicked.connect(lambda _=False: self._on_save_figures())
         self.btn_export.clicked.connect(lambda _=False: self._on_export())
         for b in (self.btn_table, self.btn_figs, self.btn_export):
-            row2.addWidget(b)
-        row2.addStretch(1)
-        self.header.addLayout(row2)
+            row.addWidget(b)
+        row.addStretch(1)
+        self.header.addLayout(row)
 
-        self.note_label = _note("")
-        self.body_layout.addWidget(self.note_label)
+        self.note_box = _NoteBox("", "Izoh va eslatmalar (CI, bo'sag', CNN)")
+        self.note_label = self.note_box.label
+        self.body_layout.addWidget(self.note_box)
+        self.std_note = QLabel("")
+        self.std_note.setWordWrap(True)
+        self.std_note.setStyleSheet(_GRAY)
+        self.std_note.hide()
+        self.body_layout.addWidget(self.std_note)
         self.metrics_table = _table(70)
         self.body_layout.addWidget(self.metrics_table)
-        self.plot_tabs = QTabWidget()
+        self.plot_tabs = _Tabs()
         self.body_layout.addWidget(self.plot_tabs, 1)
         self.roc_canvas = _canvas()
         self.pr_canvas = _canvas()
@@ -753,14 +954,15 @@ class ResultsTab(_TabBase):
         blk = _block(self._result, mode) or {}
         self._step("jadval", self._fill_table, blk, metrics)
         self.note_label.setText(self._step("izoh", self._note_text, mode, metrics) or "")
+        self._step("std izohi", self._update_std_note, metrics)
         label = dict(_MODES)[mode]
         names = list(metrics)
         prev = self.model_combo.currentData()
         cur = prev if prev in names else (ENSEMBLE_NAME if ENSEMBLE_NAME in names else (names[0] if names else None))
         _fill_combo(self.model_combo, [(_disp_name(n), n) for n in names], current=cur)
-        self._step("ROC", _draw, self.roc_canvas, plots.draw_roc, metrics, label)
-        self._step("PR", _draw, self.pr_canvas, plots.draw_pr, metrics, self._y())
-        self._step("kalibrlash", _draw, self.cal_canvas, plots.draw_calibration, metrics)
+        self._step("ROC", self._paint, self.roc_canvas, plots.draw_roc, metrics, label)
+        self._step("PR", self._paint, self.pr_canvas, plots.draw_pr, metrics, self._y())
+        self._step("kalibrlash", self._paint, self.cal_canvas, plots.draw_calibration, metrics)
         self._step("chalkashlik matritsasi", self._draw_confusion)
 
     def _fill_table(self, blk, metrics):
@@ -775,6 +977,13 @@ class ResultsTab(_TabBase):
         n = self.metrics_table.rowCount()                    # jadval balandligi qatorlarga mos (bo'sh joy qolmasin)
         h = self.metrics_table.horizontalHeader().height() + sum(self.metrics_table.rowHeight(i) for i in range(n)) + 8
         self.metrics_table.setFixedHeight(int(min(260, max(70, h))))
+
+    def _update_std_note(self, metrics):
+        """AUC std aniqlanmagan (bitta CV takrori => NaN): jadvalda bo'sh katak, bu yerda izoh."""
+        vals = [m.get("auc_std") for m in metrics.values() if isinstance(m, dict)]
+        undefined = bool(vals) and all(not math.isfinite(_num(v)) for v in vals)
+        self.std_note.setText(STD_NOTE if undefined else "")
+        self.std_note.setVisible(undefined)
 
     def _note_text(self, mode, metrics):
         parts = [CI_NOTE]
@@ -806,8 +1015,11 @@ class ResultsTab(_TabBase):
             self._end()
 
     def _draw_confusion(self):
+        self._paint_later(self.conf_canvas, self._draw_confusion_now)
+
+    def _draw_confusion_now(self):
         metrics = self._metrics()
-        _draw(self.conf_canvas, plots.draw_confusion, metrics, self.model_combo.currentData())
+        self._render(self.conf_canvas, plots.draw_confusion, metrics, self.model_combo.currentData())
 
     @_slot
     def clear(self):
@@ -815,6 +1027,8 @@ class ResultsTab(_TabBase):
         self._result = None
         self.metrics_table.set_dataframe(None)
         self.note_label.setText("")
+        self.std_note.setText("")
+        self.std_note.hide()
         _fill_combo(self.model_combo, [])
         for c in (self.roc_canvas, self.pr_canvas, self.cal_canvas, self.conf_canvas):
             _blank(c)
@@ -911,14 +1125,17 @@ class ResultsTab(_TabBase):
 class SpatialTab(_TabBase):
     """Random vs spatial AUC + fold xaritasi, fold jadvali, fon sezgirligi, nested tuning, ogohlantirishlar."""
 
+    WARN_TAB = 4                                             # "Ogohlantirishlar" sahifasi indeksi
+
     def __init__(self, parent=None):
         super().__init__(parent, hint="Modelni o'qitgandan so'ng spatial CV diagnostikasi shu yerda ko'rinadi.")
-        self.note_label = _note("")
-        self.body_layout.addWidget(self.note_label)
-        self.diag_canvas = _canvas(900, 460, (10.0, 4.8))
-        self.body_layout.addWidget(self.diag_canvas)
-        self.tabs = QTabWidget()
+        self.note_box = _NoteBox("", "Izoh: spatial blok CV")
+        self.note_label = self.note_box.label
+        self.body_layout.addWidget(self.note_box)
+        self.diag_canvas = _canvas(560, 280, (10.0, 4.8))
+        self.tabs = _Tabs()                             # grafik ham, jadvallar ham bitta tab vidjetida: ichma-ich scroll yo'q
         self.body_layout.addWidget(self.tabs, 1)
+        self.tabs.addTab(_page(self.diag_canvas), "Diagnostika grafigi")
 
         self.fold_note = _note("")
         self.fold_table = _table(200)
@@ -931,14 +1148,14 @@ class SpatialTab(_TabBase):
 
         self.tuning_note = _note("")
         self.tuning_table = _table(160)
-        self.tuning_canvas = _canvas(860, 520, (9.0, 5.4))
+        self.tuning_canvas = _canvas(520, 260, (9.0, 5.4))
         self.tabs.addTab(_page(self.tuning_note, self.tuning_table, self.tuning_canvas), "Tuning (nested)")
 
         self.warn_label = _note("")
         self.warn_list = QListWidget()
         self.warn_list.setWordWrap(True)
         self.warn_list.setTextElideMode(Qt.ElideNone)
-        self.warn_list.setMinimumHeight(180)
+        self.warn_list.setMinimumHeight(90)
         self.tabs.addTab(_page(self.warn_label, self.warn_list), "Ogohlantirishlar")
 
     @_slot
@@ -954,7 +1171,7 @@ class SpatialTab(_TabBase):
             "Spatial blok CV: bitta blok HECH QACHON train va validation orasida bo'linmaydi"
             + (f" (blok o'lchami {bs:,.0f} m)" if math.isfinite(bs) and bs > 0 else "")
             + ". Random - spatial AUC farqi avtokorrelyatsiya tufayli optimizm (leakage) taxminini beradi.")
-        self._step("diagnostika grafigi", _draw, self.diag_canvas, plots.draw_spatial_diagnostics, result)
+        self._step("diagnostika grafigi", self._paint, self.diag_canvas, plots.draw_spatial_diagnostics, result)
         # fold jadvali
         ft = fold_table_frame(result)
         self._step("fold jadvali", self.fold_table.set_dataframe, ft)
@@ -977,7 +1194,7 @@ class SpatialTab(_TabBase):
         tp = sp.get("tuned_params") if isinstance(sp.get("tuned_params"), dict) else {}
         tdf = tuning_dataframe(result)
         self._step("tuning jadvali", self.tuning_table.set_dataframe, tdf if len(tdf) else None)
-        self._step("tuning grafigi", _draw, self.tuning_canvas, plots.draw_tuning_trials, tp)
+        self._step("tuning grafigi", self._paint, self.tuning_canvas, plots.draw_tuning_trials, tp)
         self.tuning_note.setText(
             ("Nested tuning: har tashqi fold'ning train qismida giperparametr qidirilgan, baho shu fold validation'ida. "
              if tp else "Nested tuning bajarilmagan (o'chirilgan). ")
@@ -990,7 +1207,7 @@ class SpatialTab(_TabBase):
             self.warn_list.addItem(w)
         self.warn_list.setVisible(bool(warns))
         self.warn_label.setText(f"{len(warns)} ta ogohlantirish." if warns else "Ogohlantirish yo'q.")
-        self.tabs.setTabText(3, f"Ogohlantirishlar ({len(warns)})")
+        self.tabs.setTabText(self.WARN_TAB, f"Ogohlantirishlar ({len(warns)})")
         self._set_has_result(True)
         self._end()
 
@@ -1001,7 +1218,7 @@ class SpatialTab(_TabBase):
         for t in (self.fold_table, self.bg_table, self.bg_draw_table, self.tuning_table):
             t.set_dataframe(None)
         self.warn_list.clear()
-        self.tabs.setTabText(3, "Ogohlantirishlar")
+        self.tabs.setTabText(self.WARN_TAB, "Ogohlantirishlar")
         _blank(self.diag_canvas)
         _blank(self.tuning_canvas)
         self._set_has_result(False)
@@ -1040,44 +1257,6 @@ def _importance_models(result):
     return out
 
 
-def _relabel_mdi(fig, result):
-    """draw_importance barcha model panellarini 'Permutation importance' deb yozadi. MDI zaxirasi (source='mdi')
-    bo'lgan modellarda sarlavha/o'q yorlig'i to'g'rilanadi va (ma'nosiz nol) xato chiziqlari olib tashlanadi."""
-    keys = _importance_models(result)
-    axes = list(fig.axes)
-    if len(axes) < len(keys):
-        return
-    for i, (name, src) in enumerate(keys):
-        if src != "mdi":
-            continue
-        ax = axes[i]
-        old = ax.get_title()
-        pos = old.find("(eng muhim")
-        suffix = ("\n" + old[pos:]) if pos >= 0 else ""
-        ax.set_title(f"{name}\nMDI/gain importance (zaxira){suffix}", fontsize=9)
-        ax.set_xlabel("MDI/gain (model ichki o'lchovi; xato chizig'i yo'q)", fontsize=8)
-        for cont in list(ax.containers):
-            eb = getattr(cont, "errorbar", None)
-            if eb is None:
-                continue
-            for part in eb.lines:
-                for art in (part if isinstance(part, (tuple, list)) else [part]):
-                    try:
-                        if art is not None:
-                            art.remove()
-                    except Exception:                        # noqa: BLE001
-                        pass
-
-
-def _draw_importance(fig, result):
-    plots.draw_importance(fig, result)
-    try:
-        _relabel_mdi(fig, result)
-    except Exception:                                        # noqa: BLE001 - chiroyli yorliq xatosi grafikni buzmasin
-        _log.warning("MDI yorlig'ini almashtirib bo'lmadi", exc_info=True)
-    return fig
-
-
 class ImportanceTab(_TabBase):
     """Permutation + SHAP bar, SHAP beeswarm (model), SHAP dependence (model + feature), importance jadvali."""
 
@@ -1085,17 +1264,19 @@ class ImportanceTab(_TabBase):
         super().__init__(parent, hint="Modelni o'qitgandan so'ng feature importance shu yerda ko'rinadi.")
         self.method_label = _title("")
         self.method_label.setWordWrap(True)
-        self.units_label = _note("")
-        self.body_layout.addWidget(self.method_label)
-        self.body_layout.addWidget(self.units_label)
-        self.tabs = QTabWidget()
+        self.method_label.setVisible(False)
+        self.units_box = _NoteBox("", "Izoh: importance birliklari va cheklovlar")
+        self.units_label = self.units_box.label
+        self.header.addWidget(self.method_label)             # sarlavhada: o'raluvchi matn scroll hisobini buzmasin
+        self.body_layout.addWidget(self.units_box)
+        self.tabs = _Tabs()
         self.body_layout.addWidget(self.tabs, 1)
-        self.imp_canvas = _canvas(900, 620, (9.0, 6.4))
+        self.imp_canvas = _canvas(560, 320, (9.0, 6.4))
         self.tabs.addTab(_page(self.imp_canvas), "Importance (perm + SHAP)")
         # beeswarm
         self.bee_combo = QComboBox()
         self.bee_combo.currentIndexChanged.connect(lambda _i=0: self._on_bee_changed())
-        self.bee_canvas = _canvas(700, 520, (7.0, 5.2))
+        self.bee_canvas = _canvas(480, 300, (7.0, 5.2))
         brow = QHBoxLayout()
         brow.addWidget(QLabel("Model:"))
         brow.addWidget(self.bee_combo)
@@ -1111,7 +1292,7 @@ class ImportanceTab(_TabBase):
         self.dep_feature_combo = QComboBox()
         self.dep_model_combo.currentIndexChanged.connect(lambda _i=0: self._on_dep_model_changed())
         self.dep_feature_combo.currentIndexChanged.connect(lambda _i=0: self._on_dep_feature_changed())
-        self.dep_canvas = _canvas(700, 520, (7.0, 5.2))
+        self.dep_canvas = _canvas(480, 300, (7.0, 5.2))
         drow = QHBoxLayout()
         drow.addWidget(QLabel("Model:"))
         drow.addWidget(self.dep_model_combo)
@@ -1172,8 +1353,9 @@ class ImportanceTab(_TabBase):
         self._result = result
         imp = result.get("importance") if isinstance(result.get("importance"), dict) else {}
         self.method_label.setText(f"Importance usuli: {imp.get('method') or 'hisoblanmadi'}")
+        self.method_label.setVisible(True)
         self.units_label.setText(self._units_text())
-        self._step("importance grafigi", _draw, self.imp_canvas, _draw_importance, result)
+        self._step("importance grafigi", self._paint, self.imp_canvas, plots.draw_importance, result)
         shap_models = self._shap_models()
         items = [(_disp_name(m), m) for m in shap_models]
         _fill_combo(self.bee_combo, items)
@@ -1196,11 +1378,17 @@ class ImportanceTab(_TabBase):
         self.dep_feature_combo.setEnabled(bool(model))
 
     def _draw_bee(self):
-        _draw(self.bee_canvas, plots.draw_shap_beeswarm, self._result, self.bee_combo.currentData())
+        self._paint_later(self.bee_canvas, self._draw_bee_now)
+
+    def _draw_bee_now(self):
+        self._render(self.bee_canvas, plots.draw_shap_beeswarm, self._result, self.bee_combo.currentData())
 
     def _draw_dep(self):
-        _draw(self.dep_canvas, plots.draw_shap_dependence, self._result, self.dep_model_combo.currentData(),
-              self.dep_feature_combo.currentData())
+        self._paint_later(self.dep_canvas, self._draw_dep_now)
+
+    def _draw_dep_now(self):
+        self._render(self.dep_canvas, plots.draw_shap_dependence, self._result, self.dep_model_combo.currentData(),
+                     self.dep_feature_combo.currentData())
 
     @_slot
     def _on_bee_changed(self):
@@ -1223,6 +1411,7 @@ class ImportanceTab(_TabBase):
         self._begin()
         self._result = None
         self.method_label.setText("")
+        self.method_label.setVisible(False)
         self.units_label.setText("")
         for c in (self.bee_combo, self.dep_model_combo, self.dep_feature_combo):
             _fill_combo(c, [])
@@ -1237,7 +1426,7 @@ class ImportanceTab(_TabBase):
             return {}
         out = {}
         if _importance_models(self._result) or self._shap_models():      # bo'sh "Ma'lumot yo'q" rasm saqlanmasin
-            out["importance"] = _draw_importance(_new_fig((11.0, 7.5)), self._result)
+            out["importance"] = plots.draw_importance(_new_fig((11.0, 7.5)), self._result)
         for m in self._shap_models():
             out[f"shap_beeswarm_{m}"] = plots.draw_shap_beeswarm(_new_fig((8.0, 6.5)), self._result, m)
             out[f"shap_dependence_{m}"] = plots.draw_shap_dependence(_new_fig((8.0, 6.0)), self._result, m, None)
@@ -1265,8 +1454,9 @@ class MapTab(_TabBase):
         # --- boshqaruv
         self.out_picker = FolderPicker("Chiqish papkasi (GeoTIFF, jadvallar):", label_width=210)
         self.header.addWidget(self.out_picker)
-        box = QGroupBox("Sinflash sozlamalari")
+        box = QWidget()                                       # sarlavhasiz ixcham qator (vertikal joy tejaladi)
         form = QHBoxLayout(box)
+        form.setContentsMargins(0, 0, 0, 0)
         self.method_combo = QComboBox()
         for key, text in _CLASS_METHOD_TEXT:
             self.method_combo.addItem(text, key)
@@ -1275,7 +1465,7 @@ class MapTab(_TabBase):
         self.n_classes_spin.setValue(5)
         self.breaks_edit = QLineEdit("0.2, 0.4, 0.6, 0.8")
         self.breaks_edit.setPlaceholderText("0.2, 0.4, 0.6, 0.8  (vergul bilan, o'suvchi, 0..1 ichida)")
-        form.addWidget(QLabel("Usul:"))
+        form.addWidget(QLabel("Sinflash usuli:"))
         form.addWidget(self.method_combo)
         form.addWidget(QLabel("Sinflar soni:"))
         form.addWidget(self.n_classes_spin)
@@ -1292,10 +1482,9 @@ class MapTab(_TabBase):
         self.btn_export = QPushButton("Natijalarni eksport (CSV/JSON/XLSX)")
         brow.addWidget(self.btn_predict)
         brow.addWidget(self.btn_export)
-        brow.addStretch(1)
+        self.index_note = _note(INDEX_NOTE + ".")             # tugmalar yonida (alohida qator egallamaydi)
+        brow.addWidget(self.index_note, 1)
         self.header.addLayout(brow)
-        self.index_note = _note(INDEX_NOTE + ".")
-        self.header.addWidget(self.index_note)
         self.cnn_note = _note(CNN_NOTE)
         self.cnn_note.hide()
         self.header.addWidget(self.cnn_note)
@@ -1305,7 +1494,7 @@ class MapTab(_TabBase):
         self.btn_predict.clicked.connect(lambda _=False: self._on_predict())
         self.btn_export.clicked.connect(lambda _=False: self._on_export())
         # --- natija
-        self.tabs = QTabWidget()
+        self.tabs = _Tabs()
         self.body_layout.addWidget(self.tabs, 1)
         self.layer_combo = QComboBox()
         self.layer_combo.currentIndexChanged.connect(lambda _i=0: self._on_layer_changed())
@@ -1320,7 +1509,7 @@ class MapTab(_TabBase):
         mrow.addWidget(self.layer_combo, 1)
         for cb in (self.cb_aoi, self.cb_pos, self.cb_bg):
             mrow.addWidget(cb)
-        self.map_canvas = _canvas(760, 560, (7.6, 5.6))
+        self.map_canvas = _canvas(520, 320, (7.6, 5.6))
         map_page = QWidget()
         ml = QVBoxLayout(map_page)
         ml.setContentsMargins(4, 4, 4, 4)
@@ -1469,7 +1658,7 @@ class MapTab(_TabBase):
         self._step("xarita", self._draw_layer)
         curve = pred.get("success_curve")
         if isinstance(curve, dict) and curve:
-            self._step("success-rate", _draw, self.success_canvas, plots.draw_success_rate, curve)
+            self._step("success-rate", self._paint, self.success_canvas, plots.draw_success_rate, curve)
         else:
             _blank(self.success_canvas, detail="Success-rate hisoblanmagan.")
         stats = pred.get("class_stats")
@@ -1538,13 +1727,16 @@ class MapTab(_TabBase):
                 "background": self._train_bg if want(self.cb_bg) else None}
 
     def _draw_layer(self):
+        self._paint_later(self.map_canvas, self._draw_layer_now)
+
+    def _draw_layer_now(self):
         key = self.layer_combo.currentData()
         spec = self._layer_spec(key, MAP_MAX_PX_SHOW) if key else None
         if spec is None:
             _blank(self.map_canvas, detail="Tanlangan qatlam yo'q.")
             return
         arr, tr = spec.pop("array"), spec.pop("transform")
-        _draw(self.map_canvas, plots.draw_map, arr, tr, **spec, **self._overlay_kwargs(tr))
+        self._render(self.map_canvas, plots.draw_map, arr, tr, **spec, **self._overlay_kwargs(tr))
 
     @_slot
     def clear(self):
@@ -1570,7 +1762,7 @@ class MapTab(_TabBase):
                 continue
             arr, tr = spec.pop("array"), spec.pop("transform")
             fig = plots.draw_map(_new_fig((9.0, 7.5)), arr, tr, **spec, **self._overlay_kwargs(tr, use_checks=False))
-            out["map_" + str(key).replace(":", "_")] = fig
+            out["map_" + str(key).split(":", 1)[-1]] = fig             # map_<Model>, map_uncertainty, map_classes
         curve = self._pred.get("success_curve")
         if isinstance(curve, dict) and curve:
             out["success_rate"] = plots.draw_success_rate(_new_fig((7.5, 5.5)), curve)

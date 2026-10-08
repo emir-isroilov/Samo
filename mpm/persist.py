@@ -28,7 +28,7 @@ from . import __version__ as MPM_VERSION
 from .base import ModelWrapper
 from .common import (ENSEMBLE_NAME, TARGET_EPSG, check_cancel, collect_versions, noop_log, safe_name,
                      sub_progress)
-from .data import FeaturePipeline, RasterStack, find_tiff_files, load_and_align_rasters
+from .data import _INT_TOL, FeaturePipeline, RasterStack, find_tiff_files, load_and_align_rasters
 from .predict import class_area_stats, classify_map, predict_probability_maps, save_rasters
 
 BUNDLE_VERSION = 1
@@ -131,6 +131,22 @@ def _check_final_models(final_models, pipeline):
     return out
 
 
+def _check_bundle_target(directory):
+    """Saqlash joyi mavjud FAYL bo'lsa, "[Errno 17] File exists" o'rniga aniq xato ko'taradi."""
+    if os.path.exists(directory) and not os.path.isdir(directory):
+        raise ValueError(f"'{directory}' papka emas (bu mavjud fayl): bundle'ni saqlash uchun papka yo'lini "
+                         f"kiriting yoki boshqa (yangi) papka tanlang.")
+
+
+def _makedirs_checked(directory):
+    """os.makedirs; yo'l ichidagi biror qism fayl bo'lsa (Errno 17/20) aniq o'zbekcha ValueError."""
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except (FileExistsError, NotADirectoryError) as e:
+        raise ValueError(f"'{directory}' papkasini yaratib bo'lmadi: yo'ldagi biror qism papka emas (fayl) "
+                         f"({type(e).__name__}). Boshqa (yangi) papka tanlang.") from e
+
+
 def _readme_text(manifest):
     bands = ", ".join(manifest["band_names"])
     cats = ", ".join(manifest["categorical"]) or "yo'q"
@@ -182,6 +198,7 @@ def save_bundle(directory, *, final_models, pipeline, hyperparams_used, cfg_dict
     """
     log = log_fn or noop_log
     directory = os.fspath(directory)
+    _check_bundle_target(directory)
     models = _check_final_models(final_models, pipeline)
     band_names = list(pipeline.band_names)
     feature_names = list(pipeline.feature_names)
@@ -200,7 +217,7 @@ def save_bundle(directory, *, final_models, pipeline, hyperparams_used, cfg_dict
             raise ValueError(f"'{models_root}' mavjud, lekin papka MPM bundle emas (manifest.json yo'q): "
                              f"boshqa fayllarni buzmaslik uchun saqlanmadi. Bo'sh yoki yangi papka tanlang.")
         shutil.rmtree(models_root, ignore_errors=True)
-    os.makedirs(directory, exist_ok=True)
+    _makedirs_checked(directory)
     with open(marker, "w", encoding="utf-8") as f:       # saqlash yakunlanmasa, qayta saqlashga ruxsat beradi
         f.write("MPM bundle saqlanmoqda; yakunlanmagan bo'lsa bu papkadagi models/ xavfsiz o'chiriladi.\n")
 
@@ -388,6 +405,11 @@ def _check_categorical_levels(raster, pipeline, log):
         band = raster.stack[raster.band_names.index(b)]
         vals = np.unique(np.rint(band[np.isfinite(band)]))
         known = set(pipeline.levels.get(b, []))
+        vals_f = band[np.isfinite(band)]
+        n_frac = int(np.count_nonzero(np.abs(vals_f - np.rint(vals_f)) > _INT_TOL)) if vals_f.size else 0
+        if n_frac:
+            log(f"  OGOHLANTIRISH: '{b}' kategorik qatlamida {n_frac:,} ta piksel butun son emas: ularning "
+                f"one-hot ustunlari 0 bo'ladi (noma'lum daraja kabi).")
         unknown = [int(v) for v in vals if int(v) not in known]
         if unknown:
             log(f"  OGOHLANTIRISH: '{b}' kategorik qatlamida o'qitishda bo'lmagan daraja(lar) bor: "
@@ -407,6 +429,9 @@ def apply_bundle(bundle, tiff_folder, *, out_dir=None, batch_size=8192, assume_c
       "matched_files" ({band: fayl}), "ignored_files".
     """
     log = log_fn or noop_log
+    if out_dir:
+        from .pipeline import _check_out_dir
+        _check_out_dir(out_dir)
     if isinstance(bundle, (str, os.PathLike)):
         bundle = load_bundle(bundle, log_fn=log)
     pipeline = bundle["pipeline"]

@@ -71,6 +71,28 @@ ajratildi (`mpm/`), GUI `mpm/gui/` ga ko'chdi, hisoblash `QThread` ishchilarida 
 - Birinchi TIFF referens grid bo'lib qoladi; har bir TIFF fayl endi bir marta ochiladi (asl kodda birinchi fayl ikki marta ochilardi); grid mos kelsa resample qilinmaydi.
 - Bog'liqliklar: `tensorflow>=2.16` (Keras 3 kerak), `shap>=0.42`, `affine`, `openpyxl` ixtiyoriy (batafsil `requirements.txt`).
 
+- GUI (e2e tekshiruvdan keyin): natija tab'lari **tembel** to'ldiriladi (o'qitish tugagach GUI ~3 s qotmaydi: og'ir canvas
+  chizishlari tab ochilganda, bosqichma-bosqich bajariladi); tab sarlavhalari qisqartirildi (to'liq nom - tooltip'da), oyna o'lchami
+  ekranga moslanadi (min 980x640); 1-tab pastki paneli ixcham (log/hisob-kitob yig'iladi), 2-tab'da ikki qavat scroll yo'q,
+  natija tab'larida canvas pastki qismi (x yorliqlari) ko'rinadi; uzun xato matni `...` bilan qisqartiriladi (to'liq matn tooltip'da);
+  avto-eksport xatosi "Tayyor" holatini bosmaydi; 1 takrorda AUC_std jadvalda bo'sh va izoh bilan; `mpm_ml_gui.py` chiqish kodini
+  qaytaradi; `MapTab.figures()` kalitlari `map_<Model>`; yuklangan konfiguratsiyadagi NaN qiymatlar vidjetga tegmaydi; bir xil TIFF
+  papka qayta tanlanganda kategorik tanlov saqlanadi; `format_manifest` har bo'lim uchun xatoga chidamli.
+
+### Yakuniy audit tuzatishlari
+Mustaqil auditorlar topgan va takrorlangan nuqsonlar (regressiya testlari: `tests/test_audit_fixes.py`):
+- `run_config.json` endi `"kind": "run_config"` bilan yoziladi (GUI/`load_preset` uni to'liq konfiguratsiya sifatida yuklaydi),
+  asl `block_size` (0 = avto) saqlanadi, ishlatilgan qiymat esa `block_size_used` kalitida.
+- Kvadrat bo'lmagan piksellarda sinf maydoni (km2) endi piksel yuzidan hisoblanadi (`RasterStack.pixel_size = sqrt(yuz)`).
+- Qatlam statistikasi/`predictor_data_dictionary.csv` kichik (1e-9) va katta (1e13) masshtabli qatlamlarda ahamiyatli raqamlar
+  bilan yoziladi (avval 0 ga yaxlitlanardi).
+- Manfiy yoki juda katta `seed` fon generatsiyasi va diagnostikada ham ishlaydi (boshqa modullar kabi modulo).
+- `apply_bundle`: kategorik qatlamda butun bo'lmagan qiymatlar haqida ogohlantirish.
+- Fon nuqtalar generatsiyasi va blok-bootstrap Stop bilan to'xtatiladi; mavjud piksellardan ko'p fon so'ralganda urinishlar
+  soni cheklanadi (avval ~85 s qotardi).
+- Chiqish papkasi yozib bo'lmasa, o'qitish/prognoz/qo'llash hisoblashdan OLDIN aniq xato beradi (avval ish oxirida yo'qolardi).
+- Natija tab'ida saqlash xatosi keyingi muvaffaqiyatli saqlashdan keyin yashiriladi.
+
 ### Olib tashlandi
 - `SVC(probability=...)`, `GeoSeries.unary_union` (zaxira sifatida qoldi), sklearn `permutation_importance` (o'rniga AUC
   pasayishiga asoslangan o'z implementatsiyamiz), qattiq yozilgan CV/final giperparametrlari.

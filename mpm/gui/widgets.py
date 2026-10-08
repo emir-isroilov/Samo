@@ -24,9 +24,11 @@ from PyQt5.QtWidgets import (QAbstractItemView, QFileDialog, QHBoxLayout, QLabel
                              QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QTableWidget,
                              QTableWidgetItem, QVBoxLayout, QWidget)
 
-__all__ = ["FolderPicker", "MplCanvas", "DataFrameTable", "ProgressPanel", "LogView", "format_duration"]
+__all__ = ["FolderPicker", "MplCanvas", "DataFrameTable", "ProgressPanel", "LogView", "format_duration", "elide_text"]
 
 _log = logging.getLogger(__name__)
+
+PHASE_PAUSE_MS = 4                   # og'ir chizish bosqichlari orasidagi pauza: event loop (sichqoncha, paint, timer) nafas oladi
 
 
 def format_duration(seconds):
@@ -41,6 +43,16 @@ def format_duration(seconds):
     h, rem = divmod(s, 3600)
     m, sec = divmod(rem, 60)
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+
+def elide_text(text, limit=150):
+    """Matnni `limit` belgigacha qisqartiradi: oxiriga '...' qo'shiladi (jami uzunlik limit'dan oshmaydi).
+    Qisqartirilmagan matn o'zgarmaydi; limit < 4 bo'lsa ham '...' sig'adigan eng kichik uzunlik olinadi."""
+    text = "" if text is None else str(text)
+    limit = max(4, int(limit))
+    if len(text) <= limit:
+        return text
+    return text[:limit - 3].rstrip() + "..."
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +94,85 @@ class FolderPicker(QWidget):
 # ---------------------------------------------------------------------------
 # MplCanvas
 # ---------------------------------------------------------------------------
+class _PhasedCanvas(FigureCanvasQTAgg):
+    """`draw_idle()` (oyna/tab o'lchami o'zgarganda, zoom/pan, kechiktirilgan chizish) ni ikki hodisa-tsikl bosqichiga
+    bo'ladi: 1) layout (constrained) hisoblash, 2) rasterlash. Bitta og'ir grafik ~0.6 s qotish o'rniga ~0.2-0.3 s
+    bo'laklar beradi. Bosqichlar orasida yana `draw_idle()` kelsa (grafik yoki o'lcham o'zgardi), eskirgan rasterlash
+    o'tkazib yuboriladi va layout qayta hisoblanadi (ortiqcha ish yo'q). Layout dvigateli bosqichlar orasida vaqtincha
+    o'chiriladi va HAR DOIM tiklanadi; biror xato bo'lsa matplotlib'ning standart (bir bosqichli) yo'liga qaytiladi."""
+
+    def __init__(self, fig):
+        super().__init__(fig)
+        self._pp_busy = False                    # bosqichli chizish kutilmoqda/bajarilmoqda
+        self._pp_again = False                   # shu paytda yana so'rov kelgan
+        self._pp_eng = None
+        self._pp_hold = None                     # layout vaqtida o'rnatilgan "none" dvigatel (tiklashda solishtiriladi)
+        self._pp_size = None
+
+    def draw_idle(self):                         # noqa: D401
+        try:
+            if self._pp_busy:
+                self._pp_again = True
+                return
+            self._pp_busy = True
+            QTimer.singleShot(PHASE_PAUSE_MS, self._pp_layout)
+        except Exception:                        # noqa: BLE001
+            self._pp_busy = False
+            super().draw_idle()
+
+    def _pp_restore(self):
+        """Layout dvigatelini tiklaydi (grafik shu orada qayta chizilmagan bo'lsa). O'lcham o'zgargan bo'lsa True."""
+        changed = False
+        try:
+            if self._pp_eng is not None:
+                if self.figure.get_layout_engine() is self._pp_hold:
+                    self.figure.set_layout_engine(self._pp_eng)
+                changed = tuple(self.figure.get_size_inches()) != self._pp_size
+        except Exception:                        # noqa: BLE001
+            pass
+        self._pp_eng = self._pp_hold = None
+        return changed
+
+    def _pp_layout(self):
+        try:
+            self._pp_again = False
+            fig = self.figure
+            self._pp_eng = None
+            if self.width() > 0 and self.height() > 0 and fig is not None and fig.axes:
+                eng = fig.get_layout_engine()
+                if eng is not None:
+                    size = tuple(fig.get_size_inches())
+                    eng.execute(fig)
+                    fig.set_layout_engine("none")        # rasterlashda qayta hisoblanmasin
+                    self._pp_eng, self._pp_size = eng, size
+                    self._pp_hold = fig.get_layout_engine()
+        except RuntimeError:                     # vidjet o'chirilgan
+            self._pp_busy = False
+            return
+        except Exception:                        # noqa: BLE001
+            self._pp_eng = None
+        QTimer.singleShot(PHASE_PAUSE_MS, self._pp_render)
+
+    def _pp_render(self):
+        try:
+            if self._pp_again:                   # layout'dan keyin grafik/o'lcham o'zgardi: eskirgan rasterlash kerak emas
+                self._pp_restore()
+                QTimer.singleShot(PHASE_PAUSE_MS, self._pp_layout)
+                return
+            try:
+                if self.width() > 0 and self.height() > 0:
+                    self.draw()
+            except Exception:                    # noqa: BLE001
+                _log.exception("canvas chizish xatosi")
+            again = self._pp_restore()
+            self._pp_busy = False
+            self._pp_again = False
+            if again:
+                self.draw_idle()
+        except RuntimeError:                     # vidjet o'chirilgan
+            self._pp_busy = False
+
+
 class MplCanvas(QWidget):
     """matplotlib Figure + Qt canvas + navigatsiya paneli (zoom/pan/saqlash).
 
@@ -91,7 +182,7 @@ class MplCanvas(QWidget):
     def __init__(self, parent=None, figsize=(6.0, 4.5), dpi=100, with_toolbar=True):
         super().__init__(parent)
         self.fig = Figure(figsize=figsize, dpi=dpi, layout="constrained")
-        self.canvas = FigureCanvasQTAgg(self.fig)
+        self.canvas = _PhasedCanvas(self.fig)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.canvas.setMinimumSize(200, 150)
         self.toolbar = NavigationToolbar2QT(self.canvas, self) if with_toolbar else None
@@ -337,21 +428,20 @@ class ProgressPanel(QWidget):
         self._frac = 0.0
         self._active = False
         self._done = False
-        lay = QVBoxLayout(self)
+        lay = QHBoxLayout(self)                   # bitta ixcham qator: [bar] [bosqich matni] [vaqt]
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(2)
+        lay.setSpacing(8)
         self.bar = QProgressBar()
         self.bar.setRange(0, 100)
         self.bar.setValue(0)
+        self.bar.setMinimumWidth(180)
+        self.bar.setMaximumHeight(20)
         self.stage_label = QLabel("Tayyor")
         self.stage_label.setWordWrap(True)
         self.time_label = QLabel("")
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.addWidget(self.stage_label, 1)
-        row.addWidget(self.time_label)
-        lay.addWidget(self.bar)
-        lay.addLayout(row)
+        lay.addWidget(self.bar, 2)
+        lay.addWidget(self.stage_label, 3)
+        lay.addWidget(self.time_label)
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._refresh_time)
@@ -416,6 +506,7 @@ class ProgressPanel(QWidget):
         self.bar.setValue(int(round(frac * 100)))
         if msg:
             self.stage_label.setText(str(msg))
+            self.stage_label.setToolTip("")
         if not self._timer.isActive():
             self._timer.start()
         self._refresh_time()
@@ -432,16 +523,19 @@ class ProgressPanel(QWidget):
         self.bar.setValue(100)
         if msg:
             self.stage_label.setText(str(msg))
+            self.stage_label.setToolTip("")
         self._refresh_time()
 
-    def stopped(self, msg="To'xtatildi"):
-        """Bekor qilinganda/xatoda: bar joyida qoladi, taymer to'xtaydi."""
+    def stopped(self, msg="To'xtatildi", tooltip=None):
+        """Bekor qilinganda/xatoda: bar joyida qoladi, taymer to'xtaydi. `tooltip` (ixtiyoriy) - qisqartirilgan
+        `msg` ning to'liq matni (sichqoncha ustiga olib borilganda ko'rinadi)."""
         self._done = True
         self._active = False
         self._mark_end()
         self._timer.stop()
         if msg:
             self.stage_label.setText(str(msg))
+            self.stage_label.setToolTip("" if tooltip is None else str(tooltip))
         self._refresh_time()
 
     def reset(self):
@@ -455,6 +549,7 @@ class ProgressPanel(QWidget):
         self._done = False
         self.bar.setValue(0)
         self.stage_label.setText("Tayyor")
+        self.stage_label.setToolTip("")
         self.time_label.setText("")
 
     def value(self):

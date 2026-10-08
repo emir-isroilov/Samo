@@ -977,3 +977,165 @@ class TestReviewRegressions:
         dlg = SearchSpaceDialog(t)
         spaces, errors = dlg.collect()
         assert errors == [] and spaces == {}               # hammasi standart oraliqqa qaytdi
+
+
+# ===========================================================================
+# e2e tuzatishlari: xato matni ellipsisi, bosqichli canvas, ixcham 2-tab
+# ===========================================================================
+def _spin_events(ms=300):
+    from PyQt5.QtTest import QTest
+    QTest.qWait(ms)
+
+
+def _wait_until(pred, timeout_ms=10000):
+    from PyQt5.QtTest import QTest
+    left = timeout_ms
+    while not pred() and left > 0:
+        QTest.qWait(10)
+        left -= 10
+    return pred()
+
+
+class TestElideAndTooltip:
+    def test_elide_text(self):
+        from mpm.gui.widgets import elide_text
+        assert elide_text("qisqa", 150) == "qisqa"
+        s = elide_text("x" * 400, 150)
+        assert len(s) == 150 and s.endswith("...") and s.startswith("xxx")
+        assert elide_text("x" * 150, 150) == "x" * 150                    # aniq chegarada o'zgarmaydi
+        assert elide_text(None) == "" and elide_text("abcdefgh", 1).endswith("...")
+        assert len(elide_text("abc def " * 50, 40)) <= 40
+
+    def test_progress_stopped_tooltip(self):
+        pnl = ProgressPanel()
+        pnl.stopped("Xato: qisqa...", tooltip="Xato: to'liq matn")
+        assert pnl.stage_text() == "Xato: qisqa..." and pnl.stage_label.toolTip() == "Xato: to'liq matn"
+        pnl.update_progress(10, "yangi bosqich")
+        assert pnl.stage_label.toolTip() == ""                             # eski tooltip qolmaydi
+        pnl.stopped("To'xtatildi")
+        assert pnl.stage_label.toolTip() == ""
+        pnl.stopped("x", tooltip="t")
+        pnl.reset()
+        assert pnl.stage_label.toolTip() == "" and pnl.stage_text() == "Tayyor"
+
+    def test_progress_panel_is_one_compact_row(self):
+        pnl = ProgressPanel()
+        assert pnl.layout().__class__.__name__ == "QHBoxLayout"
+        assert pnl.bar.maximumHeight() <= 24
+
+
+class TestPhasedCanvas:
+    def _fig_canvas(self):
+        mc = MplCanvas(with_toolbar=False)
+        mc.resize(600, 400)
+        ax = mc.fig.add_subplot(111)
+        ax.plot([0, 1, 2], [2, 0, 1])
+        ax.set_xlabel("x yorlig'i")
+        mc.show()
+        return mc
+
+    def test_draw_idle_runs_in_two_phases_and_restores_engine(self):
+        mc = self._fig_canvas()
+        try:
+            eng = mc.fig.get_layout_engine()
+            assert eng is not None
+            mc.canvas.draw_idle()
+            assert mc.canvas._pp_busy
+            assert _wait_until(lambda: not mc.canvas._pp_busy)
+            assert mc.fig.get_layout_engine() is eng                      # layout dvigateli tiklangan
+            assert hasattr(mc.canvas, "renderer")                         # rasterlangan
+        finally:
+            mc.close()
+
+    def test_requests_are_coalesced_and_stale_render_skipped(self):
+        mc = self._fig_canvas()
+        calls = []
+        orig = mc.canvas.draw
+        mc.canvas.draw = lambda: (calls.append(1), orig())[1]
+        try:
+            for _ in range(5):
+                mc.canvas.draw_idle()                                     # 5 so'rov => 1 rasterlash
+            assert _wait_until(lambda: not mc.canvas._pp_busy)
+            assert len(calls) == 1
+            assert mc.fig.get_layout_engine() is not None
+        finally:
+            mc.close()
+
+    def test_replot_between_phases_keeps_new_engine(self):
+        """Layout bosqichidan keyin grafik qayta chizilsa (boshqa layout dvigateli), eski dvigatel qayta o'rnatilmaydi."""
+        mc = self._fig_canvas()
+        try:
+            mc.canvas.draw_idle()
+            _spin_events(5)                                               # layout bosqichi bajarildi (dvigatel 'none')
+            mc.fig.clear()
+            mc.fig.set_layout_engine("compressed")
+            mc.fig.add_subplot(111).imshow(np.arange(25).reshape(5, 5))
+            mc.canvas.draw_idle()
+            assert _wait_until(lambda: not mc.canvas._pp_busy)
+            assert type(mc.fig.get_layout_engine()).__name__ == "ConstrainedLayoutEngine"
+            assert getattr(mc.fig.get_layout_engine(), "_compress", True) is True
+            assert mc.fig.axes
+        finally:
+            mc.close()
+
+    def test_sync_redraw_still_works(self):
+        mc = self._fig_canvas()
+        try:
+            mc.redraw()
+            assert mc.last_error is None and hasattr(mc.canvas, "renderer")
+        finally:
+            mc.close()
+
+
+class TestHyperTabCompact:
+    def test_cost_hint_height_is_capped_with_own_scroll(self, panel):
+        panel.resize(900, 700)
+        panel.show()
+        try:
+            panel.set_cost_hint("\n".join(f"- qator {i}: taxminiy hisob-kitob matni" for i in range(30)))
+            _spin_events(80)
+            assert panel.cost_scroll.height() <= pp.COST_MAX_HEIGHT
+            assert panel.cost_scroll.verticalScrollBar().maximum() > 0       # ichki scroll bor
+            panel.set_cost_hint("Qisqa matn")
+            _spin_events(80)
+            assert panel.cost_scroll.height() < pp.COST_MAX_HEIGHT           # qisqa matn - kichik balandlik
+            assert panel.cost_scroll.verticalScrollBar().maximum() == 0
+        finally:
+            panel.hide()
+
+    def test_status_label_hidden_until_used(self, panel):
+        assert panel.status_label.isHidden()
+        panel._set_status("Preset saqlandi: x")
+        assert not panel.status_label.isHidden()
+        panel._set_status("")
+        assert panel.status_label.isHidden()
+
+    def test_tuning_group_is_compact(self):
+        g = TuningGroup()
+        g.resize(900, 300)
+        g.show()
+        try:
+            _spin_events(50)
+            # n_iter, inner_splits va scoring bitta qatorda (bir xil y)
+            ys = {w.mapTo(g, w.rect().topLeft()).y() // 8 for w in (g.n_iter, g.inner_splits, g.scoring)}
+            assert len(ys) == 1
+            assert g.sizeHint().height() < 215                              # eski (3 qatorli forma) ~265 edi
+        finally:
+            g.hide()
+
+    def test_panel_has_no_outer_scroll_in_main_window(self):
+        from PyQt5.QtWidgets import QScrollArea
+        from mpm.gui.main_window import MainWindow
+        w = MainWindow()
+        try:
+            assert w.tabs.widget(1) is w.hyper_panel
+            p = w.hyper_panel.parentWidget()
+            while p is not None:
+                assert not isinstance(p, QScrollArea) or p is not w.hyper_panel
+                p = p.parentWidget()
+            # model sahifalari o'z scroll'iga ega (yagona scroll qavati)
+            assert all(isinstance(w.hyper_panel.tabs.widget(i), QScrollArea) for i in range(w.hyper_panel.tabs.count()))
+        finally:
+            w._shutdown_threads()
+            w.close()
+            w.deleteLater()

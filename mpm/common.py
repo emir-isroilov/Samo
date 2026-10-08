@@ -114,6 +114,8 @@ def set_global_seed(seed=RANDOM_STATE):
 # Ixtiyoriy kutubxonalar - kechiktirib (lazy) yuklanadi, GUI tez ochilishi uchun
 # ---------------------------------------------------------------------------
 _OPTIONAL_CACHE = {}
+_OPTIONAL_ERRORS = {}        # modname -> "XatoTuri: matn" (modul topilgan, lekin import YIQILGAN bo'lsa)
+_ERR_MAX = 300
 
 
 def _has_spec(modname):
@@ -135,11 +137,20 @@ def shap_available():
     return _has_spec("shap")
 
 
+def import_error(modname):
+    """Modul topilgan (find_spec), lekin import YIQILGAN bo'lsa xato matni ("XatoTuri: xabar"), aks holda None
+    (modul o'rnatilmagan yoki hali import qilinmagan yoki import muvaffaqiyatli). Foydalanuvchi "o'rnatilmagan" emas,
+    haqiqiy sababni (masalan buzilgan TensorFlow/shap) ko'rishi uchun."""
+    return _OPTIONAL_ERRORS.get(modname)
+
+
 def _lazy_import(modname):
-    """Modulni bir marta import qiladi; muvaffaqiyatsiz bo'lsa None (va keshlanadi)."""
+    """Modulni bir marta import qiladi; muvaffaqiyatsiz bo'lsa None (keshlanadi), xato matni esa
+    import_error(modname) orqali olinadi."""
     if modname in _OPTIONAL_CACHE:
         return _OPTIONAL_CACHE[modname]
     mod = None
+    _OPTIONAL_ERRORS.pop(modname, None)
     if _has_spec(modname):
         try:
             if modname == "tensorflow":
@@ -149,8 +160,10 @@ def _lazy_import(modname):
                 # uchinchi tomon import-vaqti ogohlantirishlari (-W error muhitida ham) importni yiqitmasin
                 warnings.simplefilter("ignore")
                 mod = importlib.import_module(modname)
-        except Exception:
+        except Exception as e:
             mod = None
+            msg = " ".join(f"{type(e).__name__}: {e}".split())
+            _OPTIONAL_ERRORS[modname] = msg if len(msg) <= _ERR_MAX else msg[:_ERR_MAX - 3] + "..."
     _OPTIONAL_CACHE[modname] = mod
     return mod
 

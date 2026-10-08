@@ -238,7 +238,8 @@ class TestWindow:
     def test_eight_tabs(self, win):
         assert win.tabs.count() == 8
         assert [win.tabs.tabText(i) for i in range(8)] == list(TAB_TITLES)
-        assert win.tabs.tabText(0) == "1. Ma'lumotlar va o'qitish" and win.tabs.tabText(7) == "8. Modellar"
+        assert win.tabs.tabText(0) == "1. Ma'lumotlar" and win.tabs.tabText(7) == "8. Modellar"
+        assert win.tabs.tabToolTip(0) == "1. Ma'lumotlar va o'qitish" and win.tabs.tabToolTip(4) == "5. Spatial CV diagnostika"
         assert win.windowTitle().startswith("MPM ML GUI v2")
         names = [a.text() for a in win.menuBar().actions()]
         assert names == ["&Fayl", "&Yordam"]
@@ -918,6 +919,391 @@ class TestProtection:
             assert isinstance(win, MainWindow) and win.tabs.count() == 8
             assert sys.excepthook is mw._excepthook and mw._HOOK_STATE["window"] is win
             shutdown(win)
+        finally:
+            sys.excepthook, threading.excepthook = prev, prev_thread
+            mw._HOOK_STATE.update(state)
+
+
+# ===========================================================================
+# GUI e2e tuzatishlari: tembel to'ldirish (qotmaslik), sarlavhalar/oyna o'lchami, 1-2-tab layout, xato matni, ...
+# ===========================================================================
+def _result_for_window(flow):
+    res = dict(flow.win.training_result)
+    res["cfg"] = {**res["cfg"], "output_dir": ""}                       # avto-eksportsiz
+    return res
+
+
+def _finish_training(w, res):
+    w._job_kind = "train"
+    w._set_busy(True)
+    w._on_job_finished("train", res)
+
+
+class TestLazyFillWindow:
+    def test_training_finish_defers_heavy_drawing(self, flow, dlg):
+        """Tuzatishsiz (_fill_tabs hammasini sinxron chizadi) pending_count()==0 bo'lardi."""
+        res = _result_for_window(flow)
+        w = make_window(dlg)
+        try:
+            t0 = time.perf_counter()
+            _finish_training(w, res)
+            block = time.perf_counter() - t0
+            assert not w.is_busy() and w.training_result is res
+            for t in w.result_tab_widgets:
+                assert t.has_result() or t is w.map_tab
+                assert t.last_error is None
+            assert w.spatial_tab.pending_count() >= 1 and w.importance_tab.pending_count() >= 1
+            assert w.results_tab.pending_count() >= 1 and w.diag_tab.pending_count() == 1
+            assert not w.spatial_tab.diag_canvas.fig.axes                      # og'ir grafik hali chizilmagan
+            assert block < 1.5, block                                          # GUI oqimi bloklanmaydi (sinxron ~3 s edi)
+            assert w.spatial_tab.fold_table.rowCount() > 0                     # yengil qismlar darhol
+            n = w.fill_all_now()
+            assert n >= 5 and all(t.pending_count() == 0 for t in w.result_tab_widgets)
+            assert w.spatial_tab.diag_canvas.fig.axes and w.importance_tab.imp_canvas.fig.axes
+            assert w.results_tab.roc_canvas.fig.axes and w.diag_tab.corr_canvas.fig.axes
+            for t in w.result_tab_widgets:
+                assert t.last_error is None, (type(t).__name__, t.last_error)
+        finally:
+            shutdown(w)
+
+    def test_tab_is_drawn_when_shown_and_hidden_ones_wait(self, flow, dlg):
+        res = _result_for_window(flow)
+        w = make_window(dlg)
+        try:
+            w.resize(1100, 700)
+            w.show()
+            QTest.qWait(80)
+            _finish_training(w, res)
+            assert w.tabs.currentIndex() == TAB_RESULTS
+            assert w.wait_idle(30000)
+            assert w.results_tab.roc_canvas.fig.axes                            # ko'rinib turgan tab o'zi chizildi
+            assert not w.importance_tab.imp_canvas.fig.axes                     # ko'rinmagan tab chizilmagan (ortiqcha ish yo'q)
+            assert w.importance_tab.pending_count() >= 1
+            w.tabs.setCurrentIndex(5)
+            assert w.wait_idle(30000)
+            assert w.importance_tab.imp_canvas.fig.axes and w.importance_tab.last_error is None
+            w.tabs.setCurrentIndex(4)
+            assert w.wait_idle(30000)
+            assert w.spatial_tab.diag_canvas.fig.axes
+        finally:
+            shutdown(w)
+
+    def test_event_loop_gap_stays_small(self, flow, dlg):
+        """QTimer(20 ms) tikkerining eng katta oralig'i: o'qitish tugashi + barcha tab'larni ochish paytida."""
+        res = _result_for_window(flow)
+        w = make_window(dlg)
+        gaps, last = [], [time.perf_counter()]
+
+        def tick():
+            now = time.perf_counter()
+            gaps.append(now - last[0])
+            last[0] = now
+
+        ticker = QTimer()
+        ticker.setInterval(20)
+        ticker.timeout.connect(tick)
+        try:
+            w.resize(1100, 700)
+            w.show()
+            QTest.qWait(100)
+            ticker.start()
+            QTest.qWait(60)
+            gaps.clear()
+            last[0] = time.perf_counter()
+            _finish_training(w, res)
+            for i in range(8):
+                w.tabs.setCurrentIndex(i)
+                assert w.wait_idle(30000)
+                QTest.qWait(80)
+            QTest.qWait(100)
+            ticker.stop()
+            assert gaps and max(gaps) < 1.5, max(gaps)                         # odatda ~0.3 s; sinxron to'ldirishda ~3 s
+        finally:
+            ticker.stop()
+            shutdown(w)
+
+    def test_prediction_finish_is_lazy_too(self, flow, dlg):
+        res = _result_for_window(flow)
+        w = make_window(dlg)
+        try:
+            w.training_result = res
+            pred = flow.win._last_prediction
+            if pred is None:                                                   # alohida ishga tushirilganda: o'zimiz hisoblaymiz
+                from mpm import pipeline
+                pred = pipeline.run_prediction(res)
+            w._job_kind = "predict"
+            w._set_busy(True)
+            w._on_job_finished("predict", pred)
+            assert w.tabs.currentIndex() == TAB_MAP and w.map_tab.has_result()
+            assert w.map_tab.pending_count() >= 1 and not w.map_tab.map_canvas.fig.axes
+            w.fill_all_now()
+            assert w.map_tab.map_canvas.fig.axes and w.map_tab.last_error is None
+        finally:
+            shutdown(w)
+
+    def test_wait_idle_ignores_hidden_pending(self, flow, dlg):
+        res = _result_for_window(flow)
+        w = make_window(dlg)
+        try:
+            _finish_training(w, res)
+            assert w.importance_tab.pending_count() >= 1
+            assert w.wait_idle(5000) and not w.fill_pending()                  # ko'rinmaganlar kutilmaydi (osilib qolmaydi)
+        finally:
+            shutdown(w)
+
+
+class TestWindowSizeAndTitles:
+    def test_initial_window_size_rules(self):
+        f = mw.initial_window_size
+        assert f(1920, 1080) == (1400, 900) and f(2560, 1440) == (1400, 900)
+        assert f(1366, 768) == (1229, 691)                                     # 90% (<= 1400x900)
+        assert f(1024, 700) == (980, 640) and f(800, 600) == (980, 640)       # minimal 980x640
+        assert f(None, None) == (1400, 900) and f(0, 0) == (1400, 900) and f("x", 5) == (1400, 900)
+
+    def test_window_uses_available_geometry(self, win):
+        from PyQt5.QtGui import QGuiApplication
+        g = QGuiApplication.primaryScreen().availableGeometry()
+        exp = mw.initial_window_size(g.width(), g.height())
+        assert (win.width(), win.height()) == exp
+        assert win.width() >= 980 and win.height() >= 640
+
+    def test_tab_titles_short_with_full_tooltips(self, win):
+        assert [win.tabs.tabText(i) for i in range(8)] == ["1. Ma'lumotlar", "2. Giperparametrlar", "3. Tahlil",
+                                                           "4. Natijalar", "5. Spatial CV", "6. Importance",
+                                                           "7. Xarita", "8. Modellar"]
+        assert [win.tabs.tabToolTip(i) for i in range(8)] == list(mw.TAB_TOOLTIPS)
+        assert win.tabs.tabToolTip(2) == "3. Ma'lumotlar tahlili" and win.tabs.tabToolTip(6) == "7. Prognoz xarita"
+
+    def test_window_fits_1024_wide_screen(self, win):
+        """Regressiya: tugmalar qatorlari (4 ta uzun tugma) oynaning minimal kengligini ~1060 px ga ko'tarib, 1024 px ekranga
+        sig'dirmasdi: endi minimal kenglik boshlang'ich 980 px dan kichik, so'ralgan 1024x700 aniq shunday bo'ladi."""
+        assert win.minimumSizeHint().width() <= 980, win.minimumSizeHint()
+        for i in range(win.tabs.count()):
+            assert win.tabs.widget(i).minimumSizeHint().width() <= 980, (i, win.tabs.widget(i).minimumSizeHint())
+        win.resize(1024, 700)
+        win.show()
+        QTest.qWait(60)
+        assert (win.width(), win.height()) == (1024, 700)
+
+    @pytest.mark.parametrize("size", [(980, 640), (1024, 700), (1366, 768)])
+    def test_all_tab_titles_visible(self, win, size):
+        """Barcha sarlavhalar oyna kengligida (scroll tugmalarsiz) ko'rinadi: tab bar sizeHint <= oyna kengligi."""
+        win.resize(*size)
+        win.show()
+        QTest.qWait(60)
+        bar = win.tabs.tabBar()
+        assert bar.sizeHint().width() <= size[0] - 10, (size, bar.sizeHint().width())
+        for i in range(8):
+            r = bar.tabRect(i)
+            assert r.right() <= bar.width() and not win.tabs.tabText(i).endswith("...")
+        w_old = sum(bar.fontMetrics().horizontalAdvance(t) for t in mw.TAB_TOOLTIPS)
+        w_new = sum(bar.fontMetrics().horizontalAdvance(t) for t in mw.TAB_TITLES)
+        assert w_new < w_old
+
+
+class TestDataTabLayout:
+    def test_settings_visible_at_1024x700(self, win):
+        win.resize(1024, 700)
+        win.show()
+        QTest.qWait(100)
+        vp = win.settings_scroll.viewport()
+        assert vp.height() >= 380
+        assert win.settings_scroll.horizontalScrollBar().maximum() == 0           # gorizontal scroll yo'q (hammasi sig'adi)
+        assert win.settings_widget.minimumSizeHint().width() <= 940
+        for w in (win.picker_tiff, win.spin_background, win.spin_kfold):   # Kirish + Fon + CV guruhlari ko'rinadi
+            y = w.mapTo(vp, w.rect().topLeft()).y()
+            assert 0 <= y and y + w.height() <= vp.height(), (w, y, vp.height())
+        # pastki panel ixcham: boshqaruv + progress (1 qator) + yig'iladigan log/hisob-kitob
+        assert win.main_splitter.isCollapsible(2) and not win.main_splitter.isCollapsible(0)
+        assert win.bottom_tabs.tabText(0) == "Log" and win.bottom_tabs.tabText(1) == "Taxminiy hisob-kitob"
+        sizes = win.main_splitter.sizes()
+        assert sizes[0] > 2 * sizes[2], sizes                                # sozlamalar ko'proq joy oladi
+        assert win.log_view.parentWidget() is not None and win.cost_view.maximumHeight() > 1000   # cheklov log'da emas, splitter'da
+
+    def test_pickers_in_two_columns(self, win):
+        win.resize(1100, 700)
+        win.show()
+        QTest.qWait(60)
+        ys = [p.mapTo(win, p.rect().topLeft()).y() for p in (win.picker_tiff, win.picker_points, win.picker_aoi,
+                                                               win.picker_output)]
+        assert ys[0] == ys[1] and ys[2] == ys[3] and ys[2] > ys[0]            # 2x2 to'r (4 qator o'rniga 2)
+
+    def test_log_grows_when_training_starts(self, win):
+        win.resize(1100, 700)
+        win.show()
+        QTest.qWait(60)
+        before = win.main_splitter.sizes()[2]
+        win._ensure_log_height(150)
+        after = win.main_splitter.sizes()[2]
+        assert after >= min(150, before + 40) and after > before
+        win._ensure_log_height(150)                                          # takror chaqirish kattalashtirmaydi
+        assert win.main_splitter.sizes()[2] == after
+
+    def test_hyper_tab_cost_is_compact_and_tuning_visible(self, win):
+        win.resize(1024, 700)
+        win.show()
+        win.tabs.setCurrentIndex(1)
+        win.update_cost_hint()
+        QTest.qWait(100)
+        hp = win.hyper_panel
+        assert hp.cost_scroll.isVisible() and hp.cost_scroll.height() <= 80
+        g = hp.tuning_group
+        y = g.mapTo(hp, g.rect().topLeft()).y()
+        assert y + g.height() <= hp.height() + 1, (y, g.height(), hp.height())   # tuning guruhi to'liq ko'rinadi
+        assert hp.tabs.height() >= 200
+
+
+class TestErrorTextAndAutoexport:
+    def test_long_error_is_elided_with_tooltip(self, win, dlg):
+        long = "x" * 400
+        win._job_kind = "train"
+        win.on_job_error(long + "\n\nTraceback (most recent call last): ...", "train")
+        txt = win.progress.stage_text()
+        assert len(txt) <= mw.ERR_PROGRESS_CHARS and txt.endswith("...") and txt.startswith("Xato: xxx")
+        assert win.progress.stage_label.toolTip() == "Xato: " + long        # to'liq matn tooltip'da
+        assert dlg.errors and dlg.errors[-1][1] == long                      # dialogda ham to'liq
+        assert len(win.statusBar().currentMessage()) <= mw.ERR_PROGRESS_CHARS
+
+    def test_short_error_has_no_ellipsis(self, win, dlg):
+        win.on_job_error("qisqa xato", "train")
+        assert win.progress.stage_text() == "Xato: qisqa xato"
+
+    def test_autoexport_error_keeps_ready_state(self, win, dlg):
+        win.progress.finish("Tayyor")
+        win.on_job_error("Eksport yiqildi: disk to'la", "autoexport")
+        assert win.progress.stage_text() == "Tayyor" and win.progress.value() == 100
+        assert not dlg.errors                                                # dialog yo'q
+        text = win.log_view.toPlainText()
+        assert "XATO [autoexport]" in text and "disk to'la" in text and "Avtomatik eksport o'tkazib yuborildi" in text
+        assert "disk to'la" in win.statusBar().currentMessage()              # status qatorida
+
+    def test_autoexport_error_restores_stage_text_after_export_progress(self, win, dlg):
+        win.progress.finish("Tayyor")
+        win._on_stage_only(50, "Eksport: jadvallar yozilmoqda")
+        win.on_job_error("yiqildi", "autoexport")
+        assert win.progress.stage_text() == "Tayyor"
+
+    def test_manual_export_error_still_marks_progress(self, win, dlg):
+        win.on_job_error("qo'lda eksport yiqildi", "export")
+        assert win.progress.stage_text().startswith("Xato") and dlg.errors
+
+
+class TestConfigAndLayersFixes:
+    def test_apply_config_nan_does_not_touch_spins(self, win):
+        win.spin_background.setValue(77)
+        win.spin_min_dist.setValue(123.0)
+        win.spin_kfold.setValue(4)
+        cfg = RunConfig()
+        cfg.n_background = float("nan")
+        cfg.min_distance = float("nan")
+        cfg.n_splits = float("inf")
+        cfg.block_size = float("-inf")
+        warns = win._apply_config(cfg)
+        assert win.spin_background.value() == 77 and win.spin_min_dist.value() == 123.0 and win.spin_kfold.value() == 4
+        assert win.spin_block.value() == 0.0
+        assert sum("chekli son emas" in w for w in warns) == 4
+        assert win.spin_repeats.value() == RunConfig().n_repeats               # qolganlari odatdagidek qo'llandi
+
+    def test_apply_config_nan_class_breaks_ignored(self, win):
+        win.map_tab.breaks_edit.setText("0.3, 0.6")
+        cfg = RunConfig()
+        cfg.class_method = "fixed"
+        cfg.class_breaks = [0.2, float("nan")]
+        warns = win._apply_config(cfg)
+        assert win.map_tab.breaks_edit.text() == "0.3, 0.6" and any("chegaralar" in w for w in warns)
+
+    def test_apply_config_non_numeric_still_raises_and_rolls_back(self, win, dlg, tmp_path):
+        cfg = RunConfig()
+        cfg.n_background = "abc"
+        with pytest.raises(ValueError, match="son emas"):
+            win._apply_config(cfg)
+
+    def test_rescan_same_folder_keeps_user_categorical_choice(self, win, proj_cat):
+        win.picker_tiff.setPath(proj_cat["tiff"])
+        win._layer_scan_timer.stop()
+        win._scan_layers()
+        assert win.wait_idle(60000)
+        assert win._checked_layers() == ["geology_cat"]                        # avtomatik tavsiya
+        # foydalanuvchi tanlovni o'zgartiradi: tavsiyani olib tashlab, boshqa qatlamni belgilaydi
+        items = {win.layer_list.item(i).text(): win.layer_list.item(i) for i in range(win.layer_list.count())}
+        items["geology_cat"].setCheckState(Qt.Unchecked)
+        items["layer1"].setCheckState(Qt.Checked)
+        assert win._checked_layers() == ["layer1"]
+        # bir xil papka qayta tanlanadi (masalan, yo'l qayta kiritiladi) => tanlov YO'QOLMAYDI
+        win._scan_layers()
+        assert win._checked_layers() == ["layer1"]
+        assert win.wait_idle(60000)
+        assert win._checked_layers() == ["layer1"]                             # kechikkan tavsiya ham ustidan yozmaydi
+        assert "1 tasi kategorik" in win.layer_summary.text()
+
+    def test_rescan_other_folder_resets_choice(self, win, proj_cat, proj):
+        win.picker_tiff.setPath(proj_cat["tiff"])
+        win._layer_scan_timer.stop()
+        win._scan_layers()
+        assert win.wait_idle(60000) and win._checked_layers() == ["geology_cat"]
+        win.picker_tiff.setPath(proj["tiff"])
+        win._layer_scan_timer.stop()
+        win._scan_layers()
+        assert win.wait_idle(60000)
+        assert "geology_cat" not in win._checked_layers() and win.layer_list.count() == 4
+
+    def test_rescan_after_config_load_keeps_config_categorical(self, win, proj_cat):
+        cfg = RunConfig(tiff_folder=proj_cat["tiff"], categorical_layers=["layer2"])
+        win._apply_config(cfg)
+        assert win._checked_layers() == ["layer2"]
+        win._scan_layers()                                                    # shu papka qayta skanerlanadi
+        assert win._checked_layers() == ["layer2"]
+
+
+class TestManifestSections:
+    def test_each_section_fails_independently(self):
+        man = {"bundle_version": 1, "created_utc": "2026-01-01", "band_names": 5, "categorical": 3,
+               "models": [1, 2], "model_names": ["RandomForest"], "hyperparams_used": [1],
+               "metrics_summary": {"RandomForest": {"auc": 0.9}, "bad": 5}, "block_size": "x", "versions": [1],
+               "notes": "izoh"}
+        t = format_manifest(man)                                              # istisno chiqmaydi
+        assert "Yaratilgan (UTC): 2026-01-01" in t and "AUC=0.900" in t and "Izoh: izoh" in t
+        assert "ko'rsatib bo'lmadi" in t and "(bandlar:" in t
+        assert "ehtimollik emas" in t                                         # yakuniy eslatma har doim bor
+
+    def test_broken_section_does_not_hide_following_ones(self):
+        man = {"bundle_version": 1, "models": {"RF": 7}, "metrics_summary": {"RF": {"auc": 0.8}}}
+        t = format_manifest(man)
+        assert "(modellar: ko'rsatib bo'lmadi" in t or "- RF:" in t
+        assert "AUC=0.800" in t
+
+    def test_garbage_manifest_still_rejected_by_select(self, win, dlg, tmp_path):
+        d = tmp_path / "b"
+        d.mkdir()
+        (d / "manifest.json").write_text(json.dumps({"bundle_version": 1, "metrics_summary": 5}), encoding="utf-8")
+        assert win.load_bundle_dialog(str(d)) is None and "metrics_summary" in dlg.errors[-1][1]
+        assert win._bundle_dir is None
+
+
+class TestLauncher:
+    def test_launcher_exits_with_main_return_code(self, monkeypatch):
+        import runpy
+        monkeypatch.setattr(mw, "main", lambda argv=None: 7)
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mpm_ml_gui.py")
+        with pytest.raises(SystemExit) as ei:
+            runpy.run_path(path, run_name="__main__")
+        assert ei.value.code == 7
+
+    def test_launcher_import_does_not_start_gui(self):
+        import runpy
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mpm_ml_gui.py")
+        ns = runpy.run_path(path, run_name="mpm_ml_gui")                      # __main__ emas: hech narsa ishga tushmaydi
+        assert callable(ns["main"])
+
+    def test_main_returns_int(self, qapp, monkeypatch):
+        monkeypatch.setattr(mw, "_warmup_imports", lambda: None)
+        prev, prev_thread = sys.excepthook, threading.excepthook
+        state = dict(mw._HOOK_STATE)
+        QTimer.singleShot(100, qapp.quit)
+        try:
+            rc = mw.main(["x"])
+            assert isinstance(rc, int) and not isinstance(rc, bool)
+            shutdown(mw.LAST_WINDOW)
         finally:
             sys.excepthook, threading.excepthook = prev, prev_thread
             mw._HOOK_STATE.update(state)

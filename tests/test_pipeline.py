@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 import rasterio
 
-from mpm import pipeline
+from mpm import common, pipeline
 from mpm.common import ENSEMBLE_NAME, CancelledError, CancelToken
 from mpm.config import RunConfig, TuningConfig, default_hyperparams
 from tests.synth import make_synthetic_project
@@ -206,9 +206,9 @@ def test_nested_note_only_for_nested_tuning_mode(proj, tmp_path):
                             spaces={"RandomForest": {"n_estimators": {"min": 10, "max": 20}}})
     kw = dict(n_repeats=1, shap_enabled=False, perm_importance=False,
               use_models={"RandomForest": True, "SVM": False, "XGBoost": False, "CNN": False})
-    final = "\n".join(run_until(make_cfg(proj, tmp_path / "f", tuning=mk_t("final"), **kw), 0.70))
+    final = "\n".join(run_until(make_cfg(proj, tmp_path / "f", tuning=mk_t("final"), **kw), 0.80))   # CV metrikalari (bootstrap) endi Stop'ni hurmat qiladi: final fit'da bekor
     assert "Random vs Spatial" in final and "nested tuning bilan" not in final
-    nested = "\n".join(run_until(make_cfg(proj, tmp_path / "n", tuning=mk_t("nested"), **kw), 0.70))
+    nested = "\n".join(run_until(make_cfg(proj, tmp_path / "n", tuning=mk_t("nested"), **kw), 0.80))
     assert "nested tuning bilan" in nested
 
 
@@ -233,15 +233,163 @@ def test_patch_cnn_block_leakage_warning(proj, tmp_path):
     assert "CNN oynasidan" in logs and "leakage" in logs
 
 
-def test_metadata_separator_hint_and_constant_layer(tmp_path):
+def test_metadata_semicolon_cp1251_autodetected_and_constant_layer(tmp_path):
+    """Excel mintaqaviy sozlamasi (';' + cp1251) endi avtomatik taniladi: layer1 maydonlari o'qiladi, fayl o'zgarmaydi."""
     p = make_synthetic_project(str(tmp_path / "p"), size=60, n_layers=3, n_pos=30)
-    with open(os.path.join(p["tiff"], "metadata.csv"), "w", encoding="cp1251") as f:
+    meta = os.path.join(p["tiff"], "metadata.csv")
+    with open(meta, "w", encoding="cp1251") as f:
         f.write("band_name;source_owner;survey_date\nlayer1;Институт;2020\n")
+    before = open(meta, "rb").read()
     with rasterio.open(os.path.join(p["tiff"], "layer2.tif"), "r+") as ds:          # o'zgarmas qatlam
         ds.write(np.full((ds.height, ds.width), 3.0, dtype="float32"), 1)
     logs = "\n".join(run_until(make_cfg(p, tmp_path / "o", n_background=30), 0.14))
-    assert "UTF-8 emas" in logs or "';' ajratgich" in logs                          # ajratgich/kodlash maslahati
+    assert "avtomatik aniqlandi: ajratgich ';', kodlash cp1251" in logs
+    assert "2/3 qatlam uchun qo'lda metadata" in logs                                # layer1 to'ldirilgan deb o'qildi
+    assert "UTF-8 emas" not in logs and "ustunlar tanilmaydi" not in logs
+    assert open(meta, "rb").read() == before
     assert "'layer2' qatlami deyarli o'zgarmas" in logs and "konstant" in logs
+
+
+# ---------------------------------------------------------------------------
+# Hardening: tuning ogohlantirishlari, import xatolari, summary formati (tez)
+# ---------------------------------------------------------------------------
+RF_ONLY = {"RandomForest": True, "SVM": False, "XGBoost": False, "CNN": False}
+
+
+def tuning_cfg(proj, tmp_path, mode):
+    t = TuningConfig(enabled=True, mode=mode, n_iter=2, inner_splits=2, models=dict(RF_ONLY),
+                     spaces={"RandomForest": {"n_estimators": {"min": 10, "max": 20}}})
+    return make_cfg(proj, tmp_path, tuning=t, use_models=dict(RF_ONLY))
+
+
+def prepare_warnings(cfg):
+    ctx = pipeline._Ctx(None, None, None)
+    try:
+        pipeline._prepare(cfg, ctx)
+    finally:
+        ctx.close()
+    return ctx.warnings
+
+
+def test_non_nested_tuning_warns_cv_uses_base_hp(proj, tmp_path):
+    """Regressiya: tuning.mode != 'nested' => CV bazaviy hp bilan, yakuniy model tuned hp bilan - aniq ogohlantirish."""
+    w = [x for x in prepare_warnings(tuning_cfg(proj, tmp_path / "f", "final")) if "tuned hp" in x]
+    assert len(w) == 1 and "CV metrikalari bazaviy giperparametrlar bilan" in w[0] and "'final'" in w[0]
+    assert not [x for x in prepare_warnings(tuning_cfg(proj, tmp_path / "n", "nested")) if "tuned hp" in x]
+    off = make_cfg(proj, tmp_path / "o", use_models=dict(RF_ONLY))                 # tuning o'chiq
+    assert not [x for x in prepare_warnings(off) if "tuned hp" in x]
+
+
+def test_broken_optional_import_reports_module_and_error(proj, tmp_path, monkeypatch):
+    """Regressiya: modul bor, lekin import yiqilgan => "o'rnatilmagan" emas, modul nomi + haqiqiy xato ogohlantiriladi."""
+    monkeypatch.setattr(pipeline, "get_xgboost", lambda: None)
+    monkeypatch.setattr(pipeline, "tf_available", lambda: True)
+    monkeypatch.setattr(pipeline, "get_tf", lambda: None)
+    monkeypatch.setitem(common._OPTIONAL_ERRORS, "xgboost", "OSError: libxgboost.so buzilgan")
+    monkeypatch.setitem(common._OPTIONAL_ERRORS, "tensorflow", "ImportError: DLL load failed")
+    cfg = make_cfg(proj, tmp_path, use_models={"RandomForest": True, "SVM": False, "XGBoost": True, "CNN": True})
+    w = prepare_warnings(cfg)
+    xg = [x for x in w if "xgboost" in x]
+    tf = [x for x in w if "tensorflow" in x]
+    assert xg and "libxgboost.so buzilgan" in xg[0] and "o'rnatilgan, lekin import qilib bo'lmadi" in xg[0]
+    assert tf and "DLL load failed" in tf[0] and "CNN o'tkazib yuboriladi" in tf[0]
+    assert not any("o'rnatilmagan ('pip" in x for x in w)
+    # xato matni yo'q (modul haqiqatan o'rnatilmagan) => eski xabar
+    monkeypatch.delitem(common._OPTIONAL_ERRORS, "xgboost")
+    assert any("XGBoost o'rnatilmagan ('pip install xgboost')" in x for x in prepare_warnings(cfg))
+
+
+def test_shap_import_failure_is_reported(monkeypatch):
+    monkeypatch.setitem(common._OPTIONAL_ERRORS, "shap", "ImportError: numba mos emas")
+    monkeypatch.setattr(pipeline, "compute_shap_summary", lambda *a, **k: None)
+    ctx = pipeline._Ctx(None, None, None)
+    assert pipeline._shap(RunConfig(shap_enabled=True), ctx, {}, SimpleNamespace(X=None, feature_names=[])) is None
+    assert any("shap" in w and "numba mos emas" in w for w in ctx.warnings)
+    ctx2 = pipeline._Ctx(None, None, None)
+    monkeypatch.delitem(common._OPTIONAL_ERRORS, "shap")
+    pipeline._shap(RunConfig(shap_enabled=True), ctx2, {}, SimpleNamespace(X=None, feature_names=[]))
+    assert ctx2.warnings == []
+
+
+def fake_result(std=float("nan"), tuned=False, final_tuning=None, random=True, bg_values=(0.8,)):
+    m = lambda auc: {"auc": auc, "auc_std": std, "auc_ci95": (auc - 0.05, auc + 0.05), "pr_auc": 0.7,
+                     "sensitivity": 0.8, "specificity": 0.7, "brier": 0.2, "threshold_youden": 0.4}
+    metrics = {"RandomForest": m(0.812), ENSEMBLE_NAME: m(0.83)}
+    bg = {"n_draws": len(bg_values), "summary": {"RandomForest": {
+        "mean": float(np.mean(bg_values)), "std": 0.0, "min": min(bg_values), "max": max(bg_values),
+        "values": list(bg_values)}}}
+    return {"cfg": {"seed": 1}, "spatial": {"metrics": metrics, "n_splits": 3, "n_repeats": 1,
+                                            "tuned_params": {"RandomForest": [{"best_params": {}}]} if tuned else {}},
+            "random": {"metrics": {"RandomForest": m(0.9), ENSEMBLE_NAME: m(0.91)}} if random else None,
+            "n_positive": 30, "n_background": 60, "feature_names": ["a"], "band_names": ["a"],
+            "categorical_layers": [], "block_size": 1000.0, "model_names": ["RandomForest"],
+            "final_models": {"RandomForest": [object()]}, "bg_sensitivity": bg, "importance": {},
+            "final_tuning": final_tuning or {}, "warnings": [], "timings": {"total": 1.0}}
+
+
+def test_summary_nan_std_is_dash_not_zero_or_nan():
+    txt = pipeline._summary_text(fake_result(), None)
+    line = next(x for x in txt.splitlines() if x.strip().startswith("RandomForest: AUC=0.812"))
+    assert "(std: -, 1 takror)" in line and "nan" not in line.lower() and "0.000" not in line
+    line2 = next(x for x in pipeline._summary_text(fake_result(std=0.0123), None).splitlines()
+                 if x.strip().startswith("RandomForest: AUC=0.812"))
+    assert "+/- 0.012" in line2
+    bg = next(x for x in txt.splitlines() if "AUC 0.800" in x)
+    assert "(1 tanlov: std yo'q)" in bg and "0.000" not in bg                       # 1 draw: std 0.000 emas
+
+
+def test_summary_random_vs_spatial_tuning_notes():
+    nested = pipeline._summary_text(fake_result(tuned=True, final_tuning={"RandomForest": {}}), None)
+    assert "nested tuning bilan baholandi" in nested and "qisman tuning farqi" in nested
+    final = pipeline._summary_text(fake_result(final_tuning={"RandomForest": {}}), None)
+    assert "ikkala CV ham bazaviy giperparametrlar bilan" in final and "nested tuning bilan baholandi" not in final
+    plain = pipeline._summary_text(fake_result(), None)
+    assert "Eslatma: random CV" not in plain and "ikkala CV ham bazaviy" not in plain
+    assert "Random vs Spatial" not in pipeline._summary_text(fake_result(random=False, tuned=True), None)
+
+
+def test_summary_final_tuning_floats_pretty():
+    rec = {"scoring": "roc_auc", "best_score": 0.8123456789,
+           "best_params": {"n_estimators": 123, "max_depth": 4.123456789, "lr": np.float64(0.0123456789), "w": "uniform"}}
+    txt = pipeline._summary_text(fake_result(final_tuning={"RandomForest": rec}), None)
+    line = next(x for x in txt.splitlines() if x.strip().startswith("RandomForest: roc_auc="))
+    assert line.strip() == "RandomForest: roc_auc=0.8123 ; n_estimators=123, max_depth=4.123, lr=0.01235, w=uniform"
+    nan = pipeline._summary_text(fake_result(final_tuning={"RandomForest": {"scoring": "roc_auc",
+                                                                           "best_score": float("nan"),
+                                                                           "best_params": {}}}), None)
+    assert "roc_auc=- ;" in nan
+
+
+def test_bg_sensitivity_receives_dataset_feature_stack(proj, tmp_path, monkeypatch):
+    """Regressiya: pipeline dataset.feature_stack ni fon sezgirligiga uzatadi (CNN patch2d: qayta qurilmasin)."""
+    monkeypatch.setattr(pipeline, "tf_available", lambda: True)
+    monkeypatch.setattr(pipeline, "get_tf", lambda: object())                     # TensorFlow import qilinmaydi
+
+    def fake_run_cv(ds, groups, mode, names, hp, **kw):
+        rng = np.random.default_rng(0)
+        return {"mode": mode, "oof": {m: [rng.random(ds.n) for _ in range(kw["n_repeats"])] for m in names},
+                "fold_map": np.zeros(ds.n, dtype=int), "fold_table": pd.DataFrame(),
+                "feature_names": list(ds.feature_names), "warnings": [], "hp": hp,
+                "n_splits": kw["n_splits"], "n_repeats": kw["n_repeats"]}
+
+    class Stop(Exception):
+        pass
+
+    got = {}
+
+    def spy_bg(*a, **kw):
+        got.update(kw)
+        raise Stop
+
+    monkeypatch.setattr(pipeline, "run_cv", fake_run_cv)
+    monkeypatch.setattr(pipeline, "run_background_sensitivity", spy_bg)
+    hp = fast_hp()
+    hp["CNN"]["mode"] = "patch2d"
+    cfg = make_cfg(proj, tmp_path, hyperparams=hp, bg_sensitivity_enabled=True, run_random_cv=False, n_repeats=1,
+                   use_models={"RandomForest": True, "SVM": False, "XGBoost": False, "CNN": True})
+    with pytest.raises(Stop):
+        pipeline.run_training(cfg)
+    assert "feature_stack" in got and got["feature_stack"] is not None and got["feature_stack"].ndim == 3
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +499,74 @@ def test_reproducible_same_seed(proj, tmp_path):
     np.testing.assert_array_equal(a["dataset"].coords, b["dataset"].coords)
     # perm importance o'chirilgan -> MDI zaxirasi (RF) va SVM uchun importance yo'q
     assert a["importance"]["models"]["RandomForest"]["source"] == "mdi" and "SVM" not in a["importance"]["models"]
+
+
+# ---------------------------------------------------------------------------
+# Bekor qilish: importance/SHAP atrofida va yakunlashda; 1 repeat: std NaN (slow)
+# ---------------------------------------------------------------------------
+def small_cfg(proj, out, **kw):
+    base = dict(run_random_cv=False, n_repeats=1, n_bootstrap=0, shap_enabled=False, perm_importance=False, n_jobs=1,
+                use_models={"RandomForest": True, "SVM": True, "XGBoost": False, "CNN": False})
+    base.update(kw)
+    return make_cfg(proj, out, **base)
+
+
+def run_cancel_at(cfg, frac):
+    """progress frac'ga yetganda cancel belgilaydi; natija yoki CancelledError ko'tariladi."""
+    tok = CancelToken()
+    seen = []
+
+    def prog(f, m):
+        seen.append(f)
+        if f >= frac:
+            tok.cancel()
+
+    return pipeline.run_training(cfg, progress_fn=prog, cancel=tok), seen
+
+
+@pytest.mark.slow
+def test_cancel_between_importance_and_shap_raises(proj, tmp_path):
+    """Regressiya: ~0.95 dan keyin (importance -> SHAP orasida) Stop e'tiborsiz qolmasin (avval natija qaytardi)."""
+    with pytest.raises(CancelledError):
+        run_cancel_at(small_cfg(proj, tmp_path), 0.95)
+
+
+@pytest.mark.slow
+def test_cancel_during_shap_stage_raises(proj, tmp_path):
+    pytest.importorskip("shap")
+    cfg = small_cfg(proj, tmp_path, shap_enabled=True,
+                    use_models={"RandomForest": True, "SVM": False, "XGBoost": False, "CNN": False})
+    with pytest.raises(CancelledError):
+        run_cancel_at(cfg, 0.95)
+
+
+@pytest.mark.slow
+def test_cancel_after_shap_returns_finished_result(proj, tmp_path):
+    """Qaror: SHAP tugagach (0.98: "Importance tayyor") yoki oxirida (1.0) Stop bosilsa tayyor natija qaytariladi."""
+    for k, frac in enumerate((0.98, 1.0)):
+        res, seen = run_cancel_at(small_cfg(proj, tmp_path / str(k)), frac)
+        assert RESULT_KEYS <= set(res) and seen[-1] == 1.0 and res["thresholds"]
+        assert res["timings"]["total"] > 0
+
+
+@pytest.mark.slow
+def test_single_repeat_run_std_nan_in_exports(proj, tmp_path):
+    """1 repeat: auc_std NaN; CSV/XLSX'da bo'sh katak, summary.txt'da '-' (0.000 / nan EMAS)."""
+    res = pipeline.run_training(small_cfg(proj, tmp_path / "o", run_random_cv=True))
+    for blk in (res["spatial"], res["random"]):
+        assert all(np.isnan(m["auc_std"]) for m in blk["metrics"].values())
+        assert blk["metrics_df"]["AUC_std"].isna().all()
+    d = tmp_path / "exp"
+    pipeline.export_results(res, str(d))
+    for f in ("metrics_spatial.csv", "metrics_random.csv"):
+        df = pd.read_csv(d / f)
+        assert df["AUC_std"].isna().all() and df["AUC"].notna().all()
+        assert "nan" not in (d / f).read_text(encoding="utf-8").lower()
+    x = pd.read_excel(d / "metrics_spatial.xlsx", sheet_name=None)
+    assert all(df["AUC_std"].isna().all() for df in x.values() if "AUC_std" in df)
+    summary = (d / "summary.txt").read_text(encoding="utf-8")
+    line = next(x for x in summary.splitlines() if x.strip().startswith("RandomForest: AUC="))
+    assert "(std: -, 1 takror)" in line and "0.000" not in line and "nan" not in line.lower()
 
 
 # ---------------------------------------------------------------------------

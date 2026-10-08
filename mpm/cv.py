@@ -462,7 +462,7 @@ def _boot_stats(yb, p, thr):
             "brier": float(np.mean((p - yb) ** 2)), "balanced_accuracy_youden": bay, "f1_youden": f1y}
 
 
-def _bootstrap_ci(yb, series, groups, n_boot, seed, log):
+def _bootstrap_ci(yb, series, groups, n_boot, seed, log, cancel=None):
     """Blok-bootstrap (groups None => nuqta bootstrap): {name: {stat: (lo, hi)}} - 2.5/97.5 persentillar.
     series: {name: (mean_proba, youden_threshold)}. Bir sinfli resample'lar tashlanadi; resample'lar barcha
     seriyalar uchun umumiy (juftlashgan). n_boot=0 => (nan, nan)."""
@@ -474,7 +474,9 @@ def _bootstrap_ci(yb, series, groups, n_boot, seed, log):
     g = np.arange(n) if groups is None else groups
     vals = {name: {k: [] for k in _STAT_KEYS} for name in series}
     used = 0
-    for idx in spatial.block_bootstrap_indices(g, n_boot, random_state=seed):
+    for k, idx in enumerate(spatial.block_bootstrap_indices(g, n_boot, random_state=seed)):
+        if k % 25 == 0:
+            check_cancel(cancel)
         yi = yb[idx]
         n1 = int(yi.sum())
         if n1 == 0 or n1 == idx.size:
@@ -522,7 +524,7 @@ def _series_result(y, reps, ci, thr):
     for k in _STAT_KEYS:
         v = np.array([d[k] for d in per_rep], dtype=np.float64)
         res[k] = float(v.mean())
-        res[k + "_std"] = float(v.std(ddof=1)) if n_rep > 1 else 0.0
+        res[k + "_std"] = float(v.std(ddof=1)) if n_rep > 1 else float("nan")     # 1 repeat: std ma'nosiz (0 EMAS)
         res[k + "_ci95"] = ci[k]
     res["auc_single"] = float(roc_auc_score(y, mean_p))
     res["auc_repeats"] = np.array([d["auc"] for d in per_rep], dtype=np.float64)
@@ -544,14 +546,15 @@ def _series_result(y, reps, ci, thr):
     return res
 
 
-def compute_metrics(y, oof, groups=None, n_boot=1000, seed=RANDOM_STATE, log_fn=None):
+def compute_metrics(y, oof, groups=None, n_boot=1000, seed=RANDOM_STATE, log_fn=None, cancel=None):
     """OOF bashoratlardan metrikalar: har model va ENSEMBLE_NAME uchun. Qaytaradi: (natijalar, ansambl mean_proba).
 
     oof: {model: [(n,) massiv har repeat uchun]} (yoki (n_repeats, n) massiv / bitta (n,) massiv). Barcha modellarda
     repeat soni bir xil. Ansambl: har repeat ichida modellar o'rtachasi, so'ng repeat'lar bo'yicha statistikalar.
     Nuqtaviy metrikalar (auc, pr_auc, balanced_accuracy, f1, brier, *_youden) - repeat'lar bo'yicha O'RTACHA, "_std" -
-    repeat'lar orasidagi tanlanma std (ddof=1; 1 repeat => 0), "_ci95" - blok-bootstrap (groups None => nuqta
-    bootstrap) persentil oralig'i, mean OOF ehtimollik ustida (Youden bo'sag'i to'liq tanlanmadan olinib bootstrap'da
+    repeat'lar orasidagi tanlanma std (ddof=1; n_repeats == 1 bo'lsa std ma'nosiz => NaN, 0.0 EMAS: yagona o'lchov
+    "nol tarqoqlik" degani emas; jadval/eksport/GUI NaN'ni bo'sh ko'rsatadi), "_ci95" - blok-bootstrap (groups None
+    => nuqta bootstrap) persentil oralig'i, mean OOF ehtimollik ustida (Youden bo'sag'i to'liq tanlanmadan olinib bootstrap'da
     qotirilgan); bir sinfli resample'lar tashlanadi, n_boot=0 => (nan, nan). "balanced_accuracy"/"f1" bo'sag'i 0.5,
     "*_youden" - mean OOF'dan topilgan Youden bo'sag'i. threshold_youden, sensitivity, specificity, confusion
     ([[tn, fp], [fn, tp]]), fpr/tpr/precision/recall va calibration (kvantil, 3..10 bin) - mean OOF ehtimollik ustida.
@@ -591,7 +594,7 @@ def compute_metrics(y, oof, groups=None, n_boot=1000, seed=RANDOM_STATE, log_fn=
     yb = y == 1
     mean_ps = {name: r.mean(axis=0) for name, r in reps.items()}
     series = {name: (mean_ps[name], youden_threshold(y, mean_ps[name])) for name in reps}
-    ci = _bootstrap_ci(yb, series, groups, n_boot, int(seed), log)
+    ci = _bootstrap_ci(yb, series, groups, n_boot, int(seed), log, cancel=cancel)
 
     results = {}
     for name in reps:
@@ -599,7 +602,8 @@ def compute_metrics(y, oof, groups=None, n_boot=1000, seed=RANDOM_STATE, log_fn=
         r = results[name]
         lo, hi = r["auc_ci95"]
         ci_txt = f"95%CI {lo:.3f}-{hi:.3f}" if np.isfinite(lo) and np.isfinite(hi) else "CI hisoblanmadi"
-        log(f"  {name}: AUC={r['auc']:.3f}±{r['auc_std']:.3f} ({ci_txt}) "
+        std_txt = f"±{r['auc_std']:.3f}" if np.isfinite(r["auc_std"]) else " (1 takror: std yo'q)"
+        log(f"  {name}: AUC={r['auc']:.3f}{std_txt} ({ci_txt}) "
             f"| PR-AUC={r['pr_auc']:.3f} | BalAcc={r['balanced_accuracy']:.3f} | F1={r['f1']:.3f} "
             f"| Brier={r['brier']:.3f} | Sens/Spec@Youden={r['sensitivity']:.2f}/{r['specificity']:.2f}")
     return results, results[ENSEMBLE_NAME]["mean_proba"]
@@ -610,8 +614,9 @@ _DF_COLUMNS = ["Model", "AUC", "AUC_std", "AUC_CI_lo", "AUC_CI_hi", "PR_AUC", "B
 
 
 def metrics_dataframe(results, label=""):
-    """compute_metrics natijasidan jadval: bir qator har model (ansambl oxirida). label berilsa birinchi
-    "CV" ustuni (masalan "spatial" / "random") qo'shiladi - ikki jadvalni birlashtirish uchun."""
+    """compute_metrics natijasidan jadval: bir qator har model (ansambl oxirida). n_repeats == 1 bo'lsa AUC_std = NaN
+    (CSV/XLSX'da bo'sh katak). label berilsa birinchi "CV" ustuni (masalan "spatial" / "random") qo'shiladi -
+    ikki jadvalni birlashtirish uchun."""
     nan = float("nan")
     rows = []
     for name, m in results.items():
@@ -634,12 +639,17 @@ def metrics_dataframe(results, label=""):
 # ---------------------------------------------------------------------------
 def run_background_sensitivity(aoi_gdf, positive_gdf, raster, pipeline, hp, *, model_names, n_background, min_distance,
                                strategy, block_size, n_draws, n_splits, n_repeats, calibrate, calibration_method,
-                               calibration_cv, n_jobs, seed, log_fn=None, progress_fn=None, cancel=None):
+                               calibration_cv, n_jobs, seed, log_fn=None, progress_fn=None, cancel=None,
+                               feature_stack=None):
     """Fon nuqtalar tanlovi natijaga ta'sirini baholaydi: har draw (seed + 1000 + draw, draw 0 dan) uchun yangi fon
     nuqtalar -> dataset -> spatial bloklar (block_size; yetmasa draw o'tkazib yuboriladi) -> spatial CV ->
     compute_metrics(n_boot=0). Qaytaradi: {"per_draw": [{"draw","seed","auc":{name:auc},"n_background","block_size"}],
     "summary": {name: {"mean","std"(ddof=1),"min","max","values"}} (ansambl ham), "n_positive", "n_draws",
-    "n_draws_requested"} yoki hech draw bajarilmasa None. Model xatosi - RuntimeError (run_cv kabi)."""
+    "n_draws_requested"} yoki hech draw bajarilmasa None. Model xatosi - RuntimeError (run_cv kabi).
+
+    feature_stack (ixtiyoriy): CNN patch2d uchun tayyor (n_features, H, W) stek (pipeline dataset.feature_stack'ni
+    uzatadi). Stek nuqtalarga emas, faqat raster + pipeline'ga bog'liq, shuning uchun barcha draw'lar uchun ULASHILADI:
+    berilmasa (va CNN patch2d bo'lsa) bir marta quriladi - har draw'da qayta qurilmaydi (xotira/vaqt)."""
     from . import data      # lazy: og'ir (geopandas/rasterio) import faqat shu yerda kerak
 
     log = log_fn or noop_log
@@ -661,6 +671,7 @@ def run_background_sensitivity(aoi_gdf, positive_gdf, raster, pipeline, hp, *, m
     for w in hp_warn:
         log(f"  Giperparametr: {w}")
     need_fs = "CNN" in names and hp_clean["CNN"]["mode"] == "patch2d"
+    shared_fs = feature_stack if need_fs else None       # patch2d bo'lmasa kerak emas (xotira ushlanmaydi)
     valid = data.valid_pixel_mask(raster)
     log(f"Fon sezgirligi: {n_draws} ta draw, har birida {n_background} fon nuqta ({strategy}), "
         f"blok {bs:,.0f} m, {n_splits}-fold x {n_repeats} takror.")
@@ -674,14 +685,18 @@ def run_background_sensitivity(aoi_gdf, positive_gdf, raster, pipeline, hp, *, m
         try:
             bg = data.generate_background_points(aoi_gdf, positive_gdf, n_background, min_distance, random_state=sd,
                                                  strategy=strategy, valid_mask=valid, transform=raster.transform,
-                                                 log_fn=log)
-            ds = data.build_dataset(raster, pipeline, positive_gdf, bg, log_fn=log, need_feature_stack=need_fs)
+                                                 log_fn=log, cancel=cancel)
+            ds = data.build_dataset(raster, pipeline, positive_gdf, bg, log_fn=log, need_feature_stack=False)
             bs_d, groups = spatial.adapt_block_size(ds.coords, ds.y, n_splits, bs, log_fn=log)
         except ValueError as e:
             log(f"  Ogohlantirish: {tag} o'tkazib yuborildi: {e}")
             if progress_fn is not None:
                 progress_fn((d + 1) / n_draws, f"{tag}: o'tkazib yuborildi")
             continue
+        if need_fs:
+            if shared_fs is None:                        # birinchi yaroqli draw'da BIR marta quriladi, keyin ulashiladi
+                shared_fs = pipeline.transform_stack(raster.stack)
+            ds.feature_stack = shared_fs
         res = run_cv(ds, groups, "spatial", names, hp_clean, n_splits=n_splits, n_repeats=n_repeats,
                      calibrate=calibrate, calibration_method=calibration_method, calibration_cv=calibration_cv,
                      tuning=None, perm_importance=False, n_jobs=n_jobs, seed=sd,

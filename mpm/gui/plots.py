@@ -44,8 +44,11 @@ _log = logging.getLogger("mpm.plots")
 INDEX_LABEL = "Prospektivlik indeksi (0-1)"      # colorbar/legend uchun yagona yorliq (ehtimollik EMAS)
 NO_DATA = "Ma'lumot yo'q"
 TOP_N = 20                                        # feature'lar ko'p bo'lganda ko'rsatiladigan eng muhim soni
+MAP_MAX_PX = 2500                                 # xarita: har o'q bo'yicha chizishga ketadigan maksimal piksel (stride)
 TOP_N_THRESHOLD = 30                              # shundan ko'p feature bo'lsa top-N bilan cheklanadi
 HIGH_CORR = 0.9
+MDI_TITLE = "MDI/gain importance (zaxira)"       # source == "mdi" panellari uchun (ΔAUC EMAS)
+MDI_XLABEL = "MDI/gain (model ichki o'lchovi; xato chizig'i yo'q)"
 
 _MODEL_COLORS = {"RandomForest": "#0072B2", "SVM": "#E69F00", "XGBoost": "#009E73", "CNN": "#CC79A7"}
 _FALLBACK_COLORS = ("#56B4E9", "#D55E00", "#F0E442", "#8C564B", "#7F7F7F", "#17BECF")
@@ -74,6 +77,18 @@ def _prepare(fig):
             fig.set_constrained_layout(True)
         except Exception:
             pass
+    return fig
+
+
+def _prepare_map(fig):
+    """Xarita uchun: "compressed" layout - equal-aspect axes + colorbar bitta guruh bo'lib markazlashadi (keng/tor canvasda
+    chetda bo'sh joy qolmaydi, colorbar axes balandligiga teng)."""
+    fig.clear()
+    try:
+        fig.set_layout_engine("compressed")
+        fig.get_layout_engine().set(w_pad=0.05, h_pad=0.05, wspace=0.04, hspace=0.06)
+    except Exception:                                        # eski matplotlib: oddiy constrained
+        return _prepare(fig)
     return fig
 
 
@@ -149,6 +164,34 @@ def _ci(m, key="auc_ci95"):
     except (TypeError, ValueError, IndexError, KeyError):
         return float("nan"), float("nan")
     return lo, hi
+
+
+def _std_of(m, key="auc_std"):
+    """Takrorlar bo'yicha std (chekli bo'lsa), aks holda NaN: NaN yoki bitta takror (auc_repeats < 2) => std
+    aniqlanmagan, "± 0.000" yozilmaydi."""
+    sd = _f(m.get(key))
+    if not np.isfinite(sd) or sd < 0:
+        return float("nan")
+    reps = m.get("auc_repeats")
+    if reps is not None:
+        try:
+            if len(reps) < 2:
+                return float("nan")
+        except TypeError:
+            pass
+    return sd
+
+
+def _pm(m, key="auc_std"):
+    """Legend uchun " ± 0.012" bo'lagi (std aniqlanmagan bo'lsa bo'sh qator)."""
+    sd = _std_of(m, key)
+    return f" ± {sd:.3f}" if np.isfinite(sd) else ""
+
+
+def _ci_text(m, key="auc_ci95"):
+    """Legend uchun " (95% CI 0.700–0.900)" bo'lagi (CI NaN bo'lsa bo'sh qator)."""
+    lo, hi = _ci(m, key)
+    return f" (95% CI {lo:.3f}–{hi:.3f})" if np.isfinite(lo) and np.isfinite(hi) else ""
 
 
 def _is_ens(name):
@@ -250,6 +293,20 @@ def _short(s, n=28):
     return s if len(s) <= n else s[:n - 1] + "…"
 
 
+def _first_seq(*cands):
+    """Birinchi bo'sh bo'lmagan ketma-ketlik (list/tuple/numpy/Series); `or` ishlatilmaydi (numpy massivda
+    "truth value ambiguous" xatosi bo'lmasin). Topilmasa None."""
+    for c in cands:
+        if c is None or isinstance(c, (str, bytes)):
+            continue
+        try:
+            if len(c) > 0:
+                return c
+        except TypeError:
+            continue
+    return None
+
+
 def _names_for(p, names):
     if names is not None:
         names = [str(x) for x in names]
@@ -286,13 +343,7 @@ def draw_roc(fig, metrics, title_suffix=""):
     _prepare(fig)
     ax = fig.add_subplot(111)
     for i, (name, m) in enumerate(ms.items()):
-        auc, std = _f(m.get("auc")), _f(m.get("auc_std"))
-        lo, hi = _ci(m)
-        label = f"{name}: AUC = {auc:.3f}"
-        if np.isfinite(std):
-            label += f" ± {std:.3f}"
-        if np.isfinite(lo) and np.isfinite(hi):
-            label += f" (95% CI {lo:.3f}–{hi:.3f})"
+        label = f"{name}: AUC = {_f(m.get('auc')):.3f}{_pm(m)}{_ci_text(m)}"
         ens = _is_ens(name)
         ax.plot(_arr(m["fpr"]), _arr(m["tpr"]), lw=3.0 if ens else 1.6, color=_color(name, i),
                 zorder=3 if ens else 2, label=label)
@@ -306,8 +357,11 @@ def draw_roc(fig, metrics, title_suffix=""):
         title += f" — {title_suffix}"
     _set_title(ax, title, fontsize=11)
     ax.grid(alpha=0.25)
-    ax.legend(loc="lower right", fontsize=8, title="AUC ± std (takrorlar), 95% CI (blok-bootstrap)",
-              title_fontsize=7, framealpha=0.9)
+    has_std = any(np.isfinite(_std_of(m)) for m in ms.values())
+    has_ci = any(_ci_text(m) for m in ms.values())
+    lg_title = " va ".join(t for t in (("AUC ± std (takrorlar)" if has_std else ""),
+                                       ("95% CI (blok-bootstrap)" if has_ci else "")) if t) or None
+    ax.legend(loc="lower right", fontsize=8, title=lg_title, title_fontsize=7, framealpha=0.9)
     _footnote(fig, "Egri chiziq - takrorlar bo'yicha o'rtacha bashorat; AUC - takrorlar o'rtachasi, CI - shu o'rtacha "
                    "bashorat ustida blok-bootstrap (nuqta qiymat CI chetiga yaqin bo'lishi mumkin).")
 
@@ -339,11 +393,7 @@ def draw_pr(fig, metrics, y):
     _prepare(fig)
     ax = fig.add_subplot(111)
     for i, (name, m) in enumerate(ms.items()):
-        ap, std = _f(m.get("pr_auc")), _f(m.get("pr_auc_std"))
-        label = f"{name}: PR-AUC = {ap:.3f}" + (f" ± {std:.3f}" if np.isfinite(std) else "")
-        lo, hi = _ci(m, "pr_auc_ci95")
-        if np.isfinite(lo) and np.isfinite(hi):
-            label += f" (95% CI {lo:.3f}–{hi:.3f})"
+        label = f"{name}: PR-AUC = {_f(m.get('pr_auc')):.3f}{_pm(m, 'pr_auc_std')}{_ci_text(m, 'pr_auc_ci95')}"
         ens = _is_ens(name)
         ax.plot(_arr(m["recall"]), _arr(m["precision"]), lw=3.0 if ens else 1.6, color=_color(name, i),
                 zorder=3 if ens else 2, label=label)
@@ -422,8 +472,9 @@ def draw_confusion(fig, metrics, model=None):
             col = "white" if pct[i, j] > 55 else "#222222"
             ax.text(j, i, f"{int(round(cm[i, j]))}\n({pct[i, j]:.1f}%)", ha="center", va="center", fontsize=13,
                     fontweight="bold", color=col)
-    ax.set_xticks([0, 1], ["Bashorat: fon (0)", "Bashorat: musbat (1)"])
-    ax.set_yticks([0, 1], ["Haqiqiy: fon (0)", "Haqiqiy: musbat (1)"])
+    # ikki qatorli yorliqlar: tor canvasda (kichik matritsa) yonma-yon yorliqlar bir-birining ustiga tushmasin
+    ax.set_xticks([0, 1], ["Bashorat:\nfon (0)", "Bashorat:\nmusbat (1)"])
+    ax.set_yticks([0, 1], ["Haqiqiy:\nfon (0)", "Haqiqiy:\nmusbat (1)"])
     ax.set_xlabel("Bashorat")
     ax.set_ylabel("Haqiqiy sinf")
     thr_txt = f"Youden bo'sag'i = {thr:.3f}  |  " if np.isfinite(thr) else ""
@@ -485,11 +536,13 @@ def _bars_panel(ax, spatial_m, random_m):
             if not np.isfinite(auc):
                 continue
             lo, hi = _ci(m)
+            sd = _std_of(m)
             if np.isfinite(lo) and np.isfinite(hi):
                 err = [[max(0.0, auc - lo)], [max(0.0, hi - auc)]]
-            else:
-                sd = _f(m.get("auc_std"), 0.0)
+            elif np.isfinite(sd):
                 err = [[sd], [sd]]
+            else:
+                err = None                                   # std ham, CI ham aniqlanmagan: xato chizig'i yo'q
             ax.bar(xi + offset, auc, w, color=color, label=None if label in seen else label,
                    yerr=err, ecolor="#333333", capsize=3, error_kw={"lw": 1}, zorder=2)
             seen.add(label)
@@ -558,16 +611,19 @@ def _plain_axis(ax):
 def _bgsens_panel(ax, bg):
     summ = bg["summary"]
     names = [k for k, v in summ.items() if isinstance(v, dict)]
+    nd = bg.get("n_draws")
     for i, nm in enumerate(names):
         s = summ[nm]
-        mean, std = _f(s.get("mean")), _f(s.get("std"), 0.0)
-        ax.errorbar(i, mean, yerr=std, fmt="o", color=_color(nm, i), capsize=4, ms=6, lw=1.6, zorder=3)
+        mean, std = _f(s.get("mean")), _f(s.get("std"))
+        if _f(nd) < 2:                                       # bitta tanlov: std aniqlanmagan
+            std = float("nan")
+        ax.errorbar(i, mean, yerr=std if np.isfinite(std) and std >= 0 else None, fmt="o", color=_color(nm, i),
+                    capsize=4, ms=6, lw=1.6, zorder=3)
         lo, hi = _f(s.get("min")), _f(s.get("max"))
         if np.isfinite(lo) and np.isfinite(hi):
             ax.vlines(i, lo, hi, color=_color(nm, i), lw=4, alpha=0.3, zorder=2)
     ax.set_xticks(range(len(names)), [_disp(n) for n in names], rotation=30, ha="right", fontsize=8)
     ax.set_ylabel("AUC (o'rtacha ± std; keng chiziq - min..max)")
-    nd = bg.get("n_draws")
     _set_title(ax, "Fon nuqtalar sezgirligi" + (f"\n({nd} ta fon tanlovi)" if nd else ""), fontsize=10)
     ax.grid(axis="y", alpha=0.25)
     ax.margins(x=0.15)
@@ -703,7 +759,7 @@ def _shap_arrays(entry, result_names=None):
         raise _NoData("SHAP qiymatlari yo'q yoki bo'sh.")
     if Xa is not None and Xa.shape != sv.shape:
         Xa = None
-    names = _names_for(sv.shape[1], entry.get("feature_names") or result_names)
+    names = _names_for(sv.shape[1], _first_seq(entry.get("feature_names"), result_names))
     ev = entry.get("expected_value")
     return sv, Xa, names, entry.get("units"), (None if ev is None else _f(ev))
 
@@ -741,7 +797,7 @@ def draw_importance(fig, result):
     if models is None:                                       # zaxira: CVBlock.perm_importance
         sp = _block(result, "spatial") or {}
         models = sp.get("perm_importance") if isinstance(sp.get("perm_importance"), dict) else {}
-    names_all = imp.get("feature_names") or result.get("feature_names")
+    names_all = _first_seq(imp.get("feature_names"), result.get("feature_names"))
     perm = {}
     for k, v in models.items():
         if not isinstance(v, dict):
@@ -756,8 +812,8 @@ def draw_importance(fig, result):
         p = None
         if isinstance(v, dict):
             for key in ("mean_abs_shap", "feature_names"):
-                a = v.get(key)
-                if a is not None and len(a) > 0:
+                a = _first_seq(v.get(key))
+                if a is not None:
                     p = len(a)
                     break
             if p is None:
@@ -777,6 +833,11 @@ def draw_importance(fig, result):
     r = 0
     for c, (name, (mean, std, v)) in enumerate(perm.items()):
         ax = fig.add_subplot(gs[0, c])
+        if str(v.get("source") or "permutation").lower() == "mdi":
+            # MDI/gain zaxirasi: ΔAUC EMAS (modelning ichki o'lchovi), std - sun'iy nol => xato chizig'i yo'q
+            _bar_panel(ax, mean, None, _names_for(mean.size, names_all), _color(name, c),
+                       MDI_XLABEL, f"{name}\n{MDI_TITLE}")
+            continue
         ttl = f"{name}\nPermutation importance"
         nf, nv = v.get("n_folds"), v.get("n_valid_folds")
         if nf:
@@ -788,7 +849,7 @@ def draw_importance(fig, result):
     for c, (name, (ma, v)) in enumerate(shp.items()):
         ax = fig.add_subplot(gs[r, c])
         units = (v.get("units") if isinstance(v, dict) else None) or "model chiqishi birligida"
-        fn = (v.get("feature_names") if isinstance(v, dict) else None) or names_all
+        fn = _first_seq(v.get("feature_names") if isinstance(v, dict) else None, names_all)
         _bar_panel(ax, ma, None, _names_for(ma.size, fn), _color(name, c),
                    f"o'rtacha |SHAP| ({units})", f"{name}\nSHAP |mean|", zero_line=False)
     method = imp.get("method")
@@ -1040,7 +1101,7 @@ def draw_corr_heatmap(fig, corr):
         raise _NoData("Korrelyatsiya qiymatlari chekli emas.")
     n = M.shape[0]
     names = [str(c) for c in df.columns]
-    _prepare(fig)
+    _prepare_map(fig)                                        # kvadrat heatmap + colorbar guruhi keng canvasda markazlashadi
     ax = fig.add_subplot(111)
     cmap = _with_bad(colormaps["RdBu_r"], "#DDDDDD")
     im = ax.imshow(np.ma.masked_invalid(M), cmap=cmap, vmin=-1, vmax=1, aspect="equal", interpolation="nearest")
@@ -1148,15 +1209,20 @@ def draw_map(fig, array, transform=None, title="", cmap="RdYlGn_r", vmin=0.0, vm
     a = np.asarray(array)
     if a.ndim != 2 or a.size == 0:
         raise _NoData("Xarita massivi 2 o'lchamli (H, W) va bo'sh bo'lmasligi kerak.")
-    a = a.astype(np.float64)
-    labels = list(class_labels) if class_labels is not None and len(class_labels) > 0 else None
-    if labels is not None:
-        mask = ~np.isfinite(a) | (a <= 0)                    # 0 = nodata
-    else:
-        mask = ~np.isfinite(a)
-    if mask.all():
-        raise _NoData("Xaritada yaroqli piksel yo'q (barchasi nodata).")
     H, W = a.shape
+    labels = list(class_labels) if class_labels is not None and len(class_labels) > 0 else None
+
+    def _bad(x):
+        return (~np.isfinite(x) | (x <= 0)) if labels is not None else ~np.isfinite(x)     # sinflarda 0 = nodata
+
+    step = max(1, math.ceil(max(H, W) / MAP_MAX_PX))          # katta rasterda ichki stride (extent o'zgarmaydi)
+    a = a[::step, ::step].astype(np.float64)
+    mask = _bad(a)
+    if mask.all():
+        full = np.asarray(array, dtype=np.float64)
+        if _bad(full).all():
+            raise _NoData("Xaritada yaroqli piksel yo'q (barchasi nodata).")
+        a, mask = full, _bad(full)                           # siyrak yaroqli piksellar stride'da tushib qolgan: stridesiz
     aff = _affine(transform)
     if aff is not None:
         pa, pc, pe, pf = aff
@@ -1165,9 +1231,13 @@ def draw_map(fig, array, transform=None, title="", cmap="RdYlGn_r", vmin=0.0, vm
     else:
         extent = (0, W, H, 0)
         xlabel, ylabel = "Ustun (piksel)", "Qator (piksel)"
-    _prepare(fig)
+    _prepare_map(fig)
     ax = fig.add_subplot(111)
     base = colormaps[cmap] if isinstance(cmap, str) else cmap
+    hw = abs((extent[3] - extent[2]) / (extent[1] - extent[0])) if extent[1] != extent[0] else 1.0
+    hw = hw if np.isfinite(hw) and hw > 0 else 1.0                   # xarita balandligi/eni (equal-aspect)
+    # colorbar qalinligi ~ 5% min(eni, bo'yi), balandligi xarita balandligiga teng (aspect shunga moslanadi)
+    cb_kw = dict(location="right", fraction=0.05 * min(1.0, hw), pad=0.02, shrink=1.0, aspect=20.0 * max(1.0, hw))
     if labels is not None:
         n = len(labels)
         cm = mcolors.ListedColormap(base(np.linspace(0.08, 0.92, n)))
@@ -1175,7 +1245,7 @@ def draw_map(fig, array, transform=None, title="", cmap="RdYlGn_r", vmin=0.0, vm
         norm = mcolors.BoundaryNorm(np.arange(0.5, n + 1.5), cm.N)
         im = ax.imshow(np.ma.array(a, mask=mask), cmap=cm, norm=norm, extent=extent, origin="upper",
                        interpolation="nearest")
-        cb = fig.colorbar(im, ax=ax, ticks=np.arange(1, n + 1), shrink=0.85, pad=0.02)
+        cb = fig.colorbar(im, ax=ax, ticks=np.arange(1, n + 1), **cb_kw)
         cb.ax.set_yticklabels([_short(s, 18) for s in labels], fontsize=8)
         cb.ax.tick_params(length=0)
         if cbar_label:
@@ -1184,7 +1254,7 @@ def draw_map(fig, array, transform=None, title="", cmap="RdYlGn_r", vmin=0.0, vm
         cm = _with_bad(base, _TRANSPARENT)
         im = ax.imshow(np.ma.array(a, mask=mask), cmap=cm, vmin=vmin, vmax=vmax, extent=extent, origin="upper",
                        interpolation="nearest")
-        cb = fig.colorbar(im, ax=ax, shrink=0.85, pad=0.02)
+        cb = fig.colorbar(im, ax=ax, **cb_kw)
         if cbar_label:
             cb.set_label(cbar_label)
     handles = []
@@ -1342,6 +1412,7 @@ def _scatter_param(ax, recs, key, color):
         ax.scatter(fb_x, fb_y, s=40, marker="x", color="#D55E00", linewidths=1.6, zorder=3)
 
 
+LABEL_COL = 0.13                                             # tuning: model nomi ustuni kengligi (panel kengligiga nisbatan)
 TUNING_ROW_H = 1.25                                          # bitta panel qatori uchun minimal balandlik (dyuym)
 
 
@@ -1388,20 +1459,28 @@ def draw_tuning_trials(fig, tuned_params):
     for name, recs in models.items():
         plan.append((name, recs, _varied_params(recs)[:8]))
     ncols, plan, n_hidden = _tuning_grid(fig, plan)
-    maxc = max(14, int(float(fig.get_figwidth()) / ncols * 13))      # sarlavha panel kengligidan chiqmasin
+    try:
+        panel_w = float(fig.get_figwidth()) / (ncols + LABEL_COL)
+    except (TypeError, ValueError):
+        panel_w = 2.0
+    maxc = max(10, int(panel_w * 12))                        # sarlavha (faqat parametr nomi) panel kengligidan chiqmasin
     row_counts = [math.ceil((1 + len(p[2])) / ncols) for p in plan]
     _prepare(fig)
-    gs = fig.add_gridspec(sum(row_counts), ncols)
+    gs = fig.add_gridspec(sum(row_counts), ncols + 1, width_ratios=[LABEL_COL] + [1.0] * ncols)
     r0 = 0
     for (name, recs, params), nrows in zip(plan, row_counts):
         color = _color(name)
+        lab = fig.add_subplot(gs[r0:r0 + nrows, 0])          # model nomi - qator yorlig'i (panel sarlavhasida takrorlanmaydi)
+        lab.set_axis_off()
+        lab.text(0.5, 0.5, _short(name, 16), rotation=90, ha="center", va="center", fontsize=10,
+                 fontweight="bold", color=color, transform=lab.transAxes)
         multi = len({r.get("repeat", 0) for r in recs}) > 1
         xt = [f"{(r.get('repeat') or 0) + 1}.{(r.get('fold') or 0) + 1}" if multi else f"{(r.get('fold') or 0) + 1}"
               for r in recs]
         n_fb = sum(1 for r in recs if r.get("fallback") or r.get("skipped_reason"))
         panels = ["__score__"] + params
         for k, key in enumerate(panels):
-            ax = fig.add_subplot(gs[r0 + k // ncols, k % ncols])
+            ax = fig.add_subplot(gs[r0 + k // ncols, 1 + k % ncols])
             x = np.arange(len(recs))
             if key == "__score__":
                 best = np.array([_f(r.get("best_score")) for r in recs])
@@ -1416,13 +1495,14 @@ def draw_tuning_trials(fig, tuned_params):
                 else:
                     ax.legend(fontsize=6, loc="best", framealpha=0.85)
                 scoring = next((r.get("scoring") for r in recs if r.get("scoring")), "ball")
-                sfx = f", {n_fb}/{len(recs)} fold zaxira" if n_fb else ""        # zaxira izohi kesilmasin
-                ax.set_title(_short(f"{name} · {scoring} (ichki CV)", max(12, maxc + 12 - len(sfx))) + sfx,
-                             fontsize=8)
+                ttl = f"{_short(str(scoring), maxc)} (ichki CV)"
+                if n_fb:                                     # zaxira izohi alohida qatorda - kesilmaydi
+                    ttl += f"\n{n_fb}/{len(recs)} fold zaxira"
+                ax.set_title(ttl, fontsize=8)
                 ax.set_ylabel(str(scoring), fontsize=8)
             else:
                 _scatter_param(ax, recs, key, color)
-                ax.set_title(_short(f"{name} · {key}", maxc), fontsize=8)
+                ax.set_title(_short(key, maxc), fontsize=8)
             ax.set_xticks(x if len(recs) <= 12 else x[:: math.ceil(len(recs) / 12)])
             ax.set_xticklabels([xt[i] for i in ax.get_xticks().astype(int)], fontsize=7)
             ax.set_xlim(-0.5, len(recs) - 0.5)
@@ -1431,7 +1511,7 @@ def draw_tuning_trials(fig, tuned_params):
             if k + ncols >= len(panels):                     # x yorlig'i faqat ustun pastidagi panellarda
                 ax.set_xlabel("Tashqi fold" if not multi else "Takror.fold", fontsize=7)
         if not params:
-            ax = fig.add_subplot(gs[r0, 1 if ncols > 1 else 0])
+            ax = fig.add_subplot(gs[r0, 2 if ncols > 1 else 1])
             ax.set_axis_off()
             ax.text(0.5, 0.5, f"{name}: giperparametrlar fold'lar bo'yicha o'zgarmadi\n(qidiruv bajarilmadi yoki "
                               "bazaviy qiymat tanlandi)", ha="center", va="center", fontsize=8, color="#666666",

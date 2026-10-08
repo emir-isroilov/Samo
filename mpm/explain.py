@@ -21,7 +21,7 @@ import warnings
 import numpy as np
 from sklearn.metrics import roc_auc_score
 
-from .common import RANDOM_STATE, CancelledError, check_cancel, get_shap, noop_log
+from .common import RANDOM_STATE, CancelledError, check_cancel, get_shap, import_error, noop_log
 
 __all__ = [
     "permutation_importance_auc", "summarize_perm_importance", "normalize_shap_values",
@@ -160,7 +160,11 @@ def compute_shap_summary(final_models, X, feature_names, max_background=50, seed
     log = log_fn or noop_log
     shap = get_shap()
     if shap is None:
-        log("  SHAP kutubxonasi o'rnatilmagan ('pip install shap') - SHAP tahlili o'tkazib yuborildi.")
+        err = import_error("shap")           # modul bor, lekin import yiqilgan bo'lsa haqiqiy sabab ko'rsatiladi
+        if err:
+            log(f"  SHAP kutubxonasi import qilib bo'lmadi ({err}) - SHAP tahlili o'tkazib yuborildi.")
+        else:
+            log("  SHAP kutubxonasi o'rnatilmagan ('pip install shap') - SHAP tahlili o'tkazib yuborildi.")
         return None
     X = np.asarray(X)
     if X.ndim != 2:

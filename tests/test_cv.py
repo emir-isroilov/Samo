@@ -863,10 +863,26 @@ def test_single_model_has_ensemble_key():
     np.testing.assert_array_equal(ens, out["Only"]["mean_proba"])
 
 
-def test_single_repeat_std_is_zero():
+def test_single_repeat_std_is_nan():
+    """Regressiya: n_repeats == 1 bo'lsa repeat-std ma'nosiz => barcha "*_std" NaN (0.0 emas)."""
     y, oof = synth_oof(models=("M",), repeats=1)
-    out, _ = cv.compute_metrics(y, oof, None, n_boot=20)
-    assert out["M"]["auc_std"] == 0.0 and out["M"]["auc"] == pytest.approx(out["M"]["auc_single"])
+    logs = []
+    out, _ = cv.compute_metrics(y, oof, None, n_boot=20, log_fn=logs.append)
+    for name in ("M", ENSEMBLE_NAME):
+        m = out[name]
+        std_keys = [k for k in m if k.endswith("_std")]
+        assert set(std_keys) == {k + "_std" for k in ("auc", "pr_auc", "balanced_accuracy", "f1", "brier",
+                                                      "balanced_accuracy_youden", "f1_youden")}
+        assert all(np.isnan(m[k]) for k in std_keys)
+        assert np.isfinite(m["auc"]) and all(np.isfinite(m["auc_ci95"]))      # CI va o'rtacha saqlanadi
+    assert out["M"]["auc"] == pytest.approx(out["M"]["auc_single"])
+    assert not any("nan" in m.lower() for m in logs) and any("std yo'q" in m for m in logs)
+    df = cv.metrics_dataframe(out)
+    assert df["AUC_std"].isna().all() and df["AUC"].notna().all()
+    assert ",," in df.to_csv(index=False)                                      # CSV'da bo'sh katak
+    # 2 repeat => std chekli
+    y2, oof2 = synth_oof(models=("M",), repeats=2)
+    assert np.isfinite(cv.compute_metrics(y2, oof2, None, n_boot=0)[0]["M"]["auc_std"])
 
 
 def test_oof_input_forms():
@@ -875,7 +891,7 @@ def test_oof_input_forms():
     as2d, _ = cv.compute_metrics(y, {"A": np.vstack(oof["A"])}, None, n_boot=0)
     assert as2d["A"]["auc"] == ref["A"]["auc"]
     one, _ = cv.compute_metrics(y, {"A": oof["A"][0]}, None, n_boot=0)
-    assert one["A"]["auc_std"] == 0.0 and one["A"]["auc"] == pytest.approx(roc_auc_score(y, oof["A"][0]))
+    assert np.isnan(one["A"]["auc_std"]) and one["A"]["auc"] == pytest.approx(roc_auc_score(y, oof["A"][0]))
 
 
 def test_one_class_resamples_are_dropped():
@@ -1068,6 +1084,51 @@ def test_bg_sensitivity_pipeline_calls(ctx, monkeypatch):
     run_bg(ctx, n_draws=3, strategy="grid", seed=20)
     assert seeds == [(1020 + d, 60, 500.0, "grid", True) for d in range(3)]
     assert cv_calls == [("spatial", 1020 + d, 3, 1, None, False) for d in range(3)]
+
+
+def _spy_stack_sharing(ctx, monkeypatch, names, **over):
+    """CNN'siz: run_cv va transform_stack'ni kuzatadi (TensorFlow kerak emas). (transform_stack chaqiruvlari soni,
+    har draw'dagi ds.feature_stack ob'ektlari) qaytaradi."""
+    built, seen = [], []
+    real_ts = ctx.pipe.transform_stack
+
+    def ts(stack):
+        built.append(1)
+        return real_ts(stack)
+
+    def fake_run_cv(ds, groups, mode, model_names, hp, **kw):
+        seen.append(ds.feature_stack)
+        rng = np.random.default_rng(len(seen))
+        return {"oof": {m: [rng.random(ds.n) for _ in range(kw["n_repeats"])] for m in model_names}}
+
+    monkeypatch.setattr(ctx.pipe, "transform_stack", ts)
+    monkeypatch.setattr(cv, "run_cv", fake_run_cv)
+    hp = fast_hp()
+    hp["CNN"]["mode"] = "patch2d"
+    out = cv.run_background_sensitivity(ctx.aoi, ctx.pos, ctx.raster, ctx.pipe, hp,
+                                        **bg_kwargs(ctx, model_names=names, n_draws=3, **over))
+    return out, built, seen
+
+
+def test_bg_sensitivity_builds_feature_stack_once_and_shares(ctx, monkeypatch):
+    """Regressiya: CNN patch2d bo'lsa har draw'da to'liq feature_stack qayta qurilmasin (xotira/vaqt)."""
+    out, built, seen = _spy_stack_sharing(ctx, monkeypatch, ["RandomForest", "CNN"])
+    assert out["n_draws"] == 3 and len(seen) == 3
+    assert len(built) == 1                                       # bir marta qurildi
+    assert seen[0] is not None and seen[1] is seen[0] and seen[2] is seen[0]       # draw'lar orasida ulashilgan
+
+
+def test_bg_sensitivity_uses_given_feature_stack(ctx, monkeypatch):
+    given = ctx.ds.feature_stack
+    out, built, seen = _spy_stack_sharing(ctx, monkeypatch, ["RandomForest", "CNN"], feature_stack=given)
+    assert out["n_draws"] == 3 and built == []                   # tayyor stek berilgan: umuman qurilmaydi
+    assert all(fs is given for fs in seen)
+
+
+def test_bg_sensitivity_no_feature_stack_without_patch_cnn(ctx, monkeypatch):
+    given = ctx.ds.feature_stack
+    _, built, seen = _spy_stack_sharing(ctx, monkeypatch, ["RandomForest"], feature_stack=given)
+    assert built == [] and all(fs is None for fs in seen)        # patch2d CNN yo'q: stek kerak emas (ushlanmaydi)
 
 
 def test_bg_sensitivity_skips_draws_and_returns_none(ctx):

@@ -33,6 +33,7 @@ from ..config import TuningConfig
 __all__ = ["HyperParamPanel", "TuningGroup", "SearchSpaceDialog", "ParamField", "MODEL_TITLES"]
 
 MODEL_TITLES = {"RandomForest": "Random Forest", "SVM": "SVM", "XGBoost": "XGBoost", "CNN": "CNN"}
+COST_MAX_HEIGHT = 72                                  # xarajat izohi paneli maks. balandligi (px); oshsa - o'z scroll'i
 
 # Bir parametr boshqasining qiymatiga bog'liq bo'lib, ma'nosiz bo'lganda o'chiriladi (qiymat saqlanadi):
 # (boshqaruvchi model, parametr, bog'liq parametrlar, o'chirish sharti(qiymat) -> bool)
@@ -610,7 +611,7 @@ class TuningGroup(QGroupBox):
         row.addStretch(1)
         lay.addLayout(row)
 
-        form = QFormLayout()
+        form = QHBoxLayout()                      # 3 ta parametr bitta qatorda (vertikal joy tejaladi)
         self.n_iter = _SpinBox()
         self.n_iter.setRange(1, 2000)
         self.n_iter.setValue(TuningConfig().n_iter)
@@ -626,9 +627,12 @@ class TuningGroup(QGroupBox):
         self.scoring.addItem("ROC AUC", "roc_auc")
         self.scoring.addItem("PR AUC (average precision)", "average_precision")
         self.scoring.setToolTip("Nomzodlarni solishtirish mezoni.")
-        form.addRow("Nomzodlar soni (n_iter):", self.n_iter)
-        form.addRow("Ichki fold'lar:", self.inner_splits)
-        form.addRow("Baholash mezoni:", self.scoring)
+        for text, w in (("Nomzodlar soni (n_iter):", self.n_iter), ("Ichki fold'lar:", self.inner_splits),
+                        ("Baholash mezoni:", self.scoring)):
+            form.addWidget(QLabel(text))
+            form.addWidget(w)
+            form.addSpacing(12)
+        form.addStretch(1)
         lay.addLayout(form)
 
         srow = QHBoxLayout()
@@ -715,17 +719,22 @@ class HyperParamPanel(QWidget):
         self._loading = False
         self._model_page = {}
         root = QVBoxLayout(self)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(4)
 
         # --- tugmalar
         btns = QHBoxLayout()
-        self.btn_reset_model = QPushButton("Standart qiymatlarga qaytarish (joriy model)")
+        self.btn_reset_model = QPushButton("Standartga qaytarish (joriy model)")
         self.btn_reset_all = QPushButton("Hammasini standartga qaytarish")
-        self.btn_save = QPushButton("Preset saqlash (JSON)...")
-        self.btn_load = QPushButton("Preset yuklash (JSON)...")
+        self.btn_save = QPushButton("Preset saqlash...")
+        self.btn_load = QPushButton("Preset yuklash...")
         self.btn_reset_model.clicked.connect(lambda: self.reset_defaults(self.current_model()))
         self.btn_reset_all.clicked.connect(lambda: self.reset_defaults(None))
         self.btn_save.clicked.connect(self.save_preset_dialog)
         self.btn_load.clicked.connect(self.load_preset_dialog)
+        self.btn_reset_model.setToolTip("Joriy model (tab) giperparametrlarini standart qiymatlarga qaytarish.")
+        self.btn_save.setToolTip("Giperparametrlar va tuning sozlamalarini JSON presetga saqlash.")
+        self.btn_load.setToolTip("Giperparametrlar va tuning sozlamalarini JSON presetdan yuklash.")
         for b in (self.btn_reset_model, self.btn_reset_all, self.btn_save, self.btn_load):
             btns.addWidget(b)
         btns.addStretch(1)
@@ -733,15 +742,23 @@ class HyperParamPanel(QWidget):
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
+        self.status_label.setVisible(False)                   # bo'sh bo'lganda joy egallamasin
         root.addWidget(self.status_label)
 
         # --- umumiy xarajat izohi
+        # (uzun matn joyni egallamasin: balandligi cheklangan, o'z scroll'i bor)
         self.cost_label = QLabel("")
         self.cost_label.setWordWrap(True)
         self.cost_label.setFrameShape(QFrame.StyledPanel)
         self.cost_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.cost_label.setVisible(False)
-        root.addWidget(self.cost_label)
+        self.cost_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.cost_scroll = QScrollArea()
+        self.cost_scroll.setWidgetResizable(True)
+        self.cost_scroll.setFrameShape(QFrame.NoFrame)
+        self.cost_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.cost_scroll.setWidget(self.cost_label)
+        self.cost_scroll.setVisible(False)
+        root.addWidget(self.cost_scroll)
 
         # --- model tablari
         self.tabs = QTabWidget()
@@ -888,7 +905,26 @@ class HyperParamPanel(QWidget):
         """estimate_cost_text natijasini ko'rsatadi (bo'sh matn => yashiriladi)."""
         text = "" if text is None else str(text)
         self.cost_label.setText(text)
-        self.cost_label.setVisible(bool(text.strip()))
+        self.cost_scroll.setVisible(bool(text.strip()))
+        self._fit_cost_height()
+
+    def _set_status(self, text):
+        self.status_label.setText(text)
+        self.status_label.setVisible(bool(text))
+
+    def _fit_cost_height(self):
+        """Xarajat izohi balandligi: matnga mos, lekin COST_MAX_HEIGHT dan oshmaydi (oshsa - ichki scroll)."""
+        try:
+            w = max(200, self.cost_scroll.viewport().width() - 4)
+            h = self.cost_label.heightForWidth(w) if self.cost_label.hasHeightForWidth() else self.cost_label.sizeHint().height()
+            self.cost_scroll.setFixedHeight(int(min(COST_MAX_HEIGHT, max(24, h + 6))))
+        except RuntimeError:
+            pass
+
+    def resizeEvent(self, event):                # noqa: N802
+        super().resizeEvent(event)
+        if self.cost_scroll.isVisibleTo(self):
+            self._fit_cost_height()
 
     def cost_hint(self):
         return self.cost_label.text()
@@ -924,7 +960,7 @@ class HyperParamPanel(QWidget):
         except Exception as exc:                 # noqa: BLE001
             self._show_message("critical", "Preset saqlanmadi", f"{type(exc).__name__}: {exc}")
             return None
-        self.status_label.setText(f"Preset saqlandi: {path}")
+        self._set_status(f"Preset saqlandi: {path}")
         return path
 
     def load_preset_dialog(self):
@@ -936,7 +972,7 @@ class HyperParamPanel(QWidget):
         except Exception as exc:                 # noqa: BLE001
             self._show_message("critical", "Preset yuklanmadi", f"{type(exc).__name__}: {exc}")
             return None
-        self.status_label.setText(f"Preset yuklandi: {os.path.basename(path)}")
+        self._set_status(f"Preset yuklandi: {os.path.basename(path)}")
         if warns:
             self._show_message("warning", "Preset ogohlantirishlari", "\n".join(warns))
         return path

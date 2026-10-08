@@ -373,7 +373,7 @@ class TestSpatialTab:
         assert "hisoblanmagan" in t.bg_label.text() and t.bg_table.rowCount() == 0
         assert t.tuning_table.rowCount() == 0 and "bajarilmagan" in t.tuning_note.text()
         n_w = len(result["warnings"])
-        assert t.warn_list.count() == n_w and f"({n_w})" in t.tabs.tabText(3)
+        assert t.warn_list.count() == n_w and f"({n_w})" in t.tabs.tabText(t.WARN_TAB)
         assert t.diag_canvas.last_error is None
 
     def test_with_bg_and_tuning(self, result):
@@ -644,7 +644,7 @@ class TestMapTab:
         assert t.stats_table.rowCount() == len(prediction["class_stats"])
         assert "prospektivlik indeksi" in t.stats_note.text()
         figs = t.figures()
-        assert {"map_map_RandomForest", "map_uncertainty", "map_classes", "success_rate"} <= set(figs)
+        assert {"map_RandomForest", "map_uncertainty", "map_classes", "success_rate"} <= set(figs)
         assert all(f.axes for f in figs.values())
         t.clear()
         assert not t.has_result() and not t.btn_predict.isEnabled() and t.figures() == {}
@@ -851,3 +851,227 @@ class TestRobustness:
         names = {os.path.basename(p) for p in paths}
         assert {"corr_heatmap.png", "importance.png", "spatial_cv_diagnostics.png", "success_rate.png",
                 "roc_spatial.png"} <= names
+
+
+# ===========================================================================
+# GUI qotmasligi: tembel (lazy) chizish; ixcham layout; std izohi (e2e tuzatishlari)
+# ===========================================================================
+def _spin(ms=400):
+    from PyQt5.QtTest import QTest
+    QTest.qWait(ms)
+
+
+def _wait_until(pred, timeout_ms=15000):
+    from PyQt5.QtTest import QTest
+    left = timeout_ms
+    while not pred() and left > 0:
+        QTest.qWait(20)
+        left -= 20
+    return pred()
+
+
+class TestLazyFill:
+    def test_default_is_eager(self, result):
+        """lazy_fill=False (standart): hammasi darhol chiziladi, kutayotgan canvas yo'q."""
+        for t in (ResultsTab(), SpatialTab(), ImportanceTab()):
+            t.set_result(result)
+            assert t.pending_count() == 0 and t.lazy_fill is False
+        t = SpatialTab()
+        t.set_result(result)
+        assert t.diag_canvas.fig.axes
+
+    def test_lazy_defers_heavy_drawing_until_flush(self, result):
+        """Tuzatishsiz (lazy_fill yo'q) set_result canvas'larni darhol chizadi => bu test yiqiladi."""
+        t = SpatialTab()
+        t.lazy_fill = True
+        t.set_result(result)
+        t.lazy_fill = False
+        _ok(t)
+        assert t.has_result() and t.fold_table.rowCount() > 0           # yengil qismlar (jadval) darhol
+        assert t.pending_count() >= 1 and not t.diag_canvas.fig.axes     # og'ir grafik hali chizilmagan
+        assert t.flush() >= 1 and t.pending_count() == 0
+        assert t.diag_canvas.fig.axes and t.diag_canvas.last_error is None
+
+    @pytest.mark.parametrize("make", [lambda r: (ImportanceTab(), "imp_canvas"), lambda r: (ResultsTab(), "roc_canvas")])
+    def test_lazy_then_flush_equals_eager(self, result, make):
+        lazy, name = make(result)
+        eager, _ = make(result)
+        lazy.lazy_fill = True
+        lazy.set_result(result)
+        lazy.lazy_fill = False
+        eager.set_result(result)
+        assert lazy.pending_count() >= 1
+        lazy.flush()
+        la, ea = getattr(lazy, name).fig.axes, getattr(eager, name).fig.axes
+        assert len(la) == len(ea) > 0
+        assert [a.get_title() for a in la] == [a.get_title() for a in ea]
+
+    def test_flush_one_draws_one_canvas(self, result):
+        t = ImportanceTab()
+        t.lazy_fill = True
+        t.set_result(result)
+        t.lazy_fill = False
+        n = t.pending_count()
+        assert n >= 2                                                   # importance + beeswarm + dependence
+        assert t.flush_one() == n - 1
+
+    def test_new_result_or_clear_drops_stale_pending(self, result):
+        t = ImportanceTab()
+        t.lazy_fill = True
+        t.set_result(result)
+        t.lazy_fill = False
+        assert t.pending_count() >= 1
+        t.clear()
+        assert t.pending_count() == 0 and t.flush() == 0
+
+    def test_visible_canvas_is_drawn_without_flush(self, result):
+        """Canvas ko'rsatilganda (tab ochilganda) kechiktirilgan chizish o'zi bajariladi (event loop orqali)."""
+        t = SpatialTab()
+        t.resize(1000, 600)
+        t.lazy_fill = True
+        t.set_result(result)
+        t.lazy_fill = False
+        assert not t.diag_canvas.fig.axes
+        t.show()
+        try:
+            assert _wait_until(lambda: t.diag_canvas.fig.axes and t.visible_pending_count() == 0)
+            assert t.pending_count() >= 1                              # ko'rinmagan sahifadagi tuning canvas kutadi
+            t.tabs.setCurrentIndex(3)                                   # "Tuning (nested)" sahifasi ochildi
+            assert _wait_until(lambda: t.pending_count() == 0 and t.visible_pending_count() == 0)
+            _ok(t)
+        finally:
+            t.close()
+
+    def test_map_prediction_lazy(self, result, prediction):
+        t = MapTab()
+        t.set_result(result)
+        t.lazy_fill = True
+        t.set_prediction(prediction)
+        t.lazy_fill = False
+        _ok(t)
+        assert t.has_result() and t.pending_count() >= 1 and t.stats_table.rowCount() > 0
+        t.flush()
+        texts = " ".join(tx.get_text() for ax in t.map_canvas.fig.axes for tx in ax.texts)
+        assert t.map_canvas.fig.axes and "Ma'lumot yo'q" not in texts
+
+    def test_diagnostics_lazy(self, result):
+        t = DiagnosticsTab()
+        t.lazy_fill = True
+        t.set_diagnostics(result["diagnostics"], result["data_dictionary"])
+        t.lazy_fill = False
+        assert t.has_result() and t.pending_count() == 1 and not t.corr_canvas.fig.axes
+        t.flush()
+        assert t.corr_canvas.fig.axes
+
+    def test_deferred_error_is_contained(self, result, monkeypatch):
+        t = ImportanceTab()
+
+        def boom(fig, *a, **k):
+            raise RuntimeError("chizish yiqildi")
+
+        monkeypatch.setattr(plots, "draw_importance", boom)
+        t.lazy_fill = True
+        t.set_result(result)
+        t.lazy_fill = False
+        t.flush()                                                       # istisno tashqariga chiqmaydi
+        texts = " ".join(tx.get_text() for ax in t.imp_canvas.fig.axes for tx in ax.texts)
+        assert "chizish yiqildi" in texts
+
+
+class TestCompactLayout:
+    def _shown(self, tab, w=1024, h=600):
+        tab.resize(w, h)
+        tab.show()
+        _spin(120)
+
+    def test_no_nested_scroll_and_canvas_fits_1024x700(self, result, prediction):
+        """Natija tab'lari 1024x700 oyna ichida (viewport ~ 600px) yagona scroll'siz sig'adi: tana minimal balandligi
+        viewport'dan kichik (canvas pastki qismi va x yorliqlari ko'rinadi)."""
+        tabs = {"res": ResultsTab(), "sp": SpatialTab(), "imp": ImportanceTab(), "map": MapTab(), "diag": DiagnosticsTab()}
+        tabs["diag"].set_diagnostics(result["diagnostics"], result["data_dictionary"])
+        for k in ("res", "sp", "imp", "map"):
+            tabs[k].set_result(result)
+        tabs["map"].set_prediction(prediction)
+        for name, t in tabs.items():
+            self._shown(t, 1000, 612)
+            sub = getattr(t, "plot_tabs", None) or getattr(t, "tabs", None)
+            for j in range(sub.count()):
+                sub.setCurrentIndex(j)
+                _spin(40)
+                assert t.scroll.verticalScrollBar().maximum() == 0, (name, j, t.scroll.verticalScrollBar().maximum())
+            t.close()
+
+    def test_inner_tabs_do_not_propagate_height_for_width(self):
+        from PyQt5.QtWidgets import QLabel
+        tw = rt._Tabs()
+        lab = QLabel("so'z " * 80)
+        lab.setWordWrap(True)
+        tw.addTab(lab, "a")
+        assert tw.hasHeightForWidth() is False and tw.heightForWidth(300) == -1
+
+    def test_long_notes_are_collapsed_but_keep_text(self, result):
+        t = ResultsTab()
+        t.set_result(result)
+        assert "blok-bootstrap" in t.note_label.text()                 # matn saqlanadi (testlar/ma'lumot)
+        assert t.note_box.button.isChecked() is False and t.note_label.isHidden()
+        t.note_box.button.setChecked(True)
+        assert not t.note_label.isHidden()
+
+    def test_spatial_warning_tab_index(self, result):
+        t = SpatialTab()
+        t.set_result(result)
+        assert t.tabs.tabText(0) == "Diagnostika grafigi"
+        assert t.tabs.tabText(t.WARN_TAB).startswith("Ogohlantirishlar")
+
+    def test_tables_have_small_minimum_height(self):
+        assert rt._table(220).minimumHeight() <= 100 and rt._table().minimumHeight() <= 100
+
+    def test_canvas_minimum_is_small(self):
+        c = rt._canvas()
+        assert c.canvas.minimumHeight() <= 260 and c.canvas.minimumWidth() <= 520
+
+
+class TestStdNote:
+    def _res(self, result, std):
+        res = copy.copy(result)
+        sp = dict(result["spatial"])
+        sp["metrics"] = {k: {**v, "auc_std": std} for k, v in sp["metrics"].items()}
+        df = sp["metrics_df"].copy()
+        df["AUC_std"] = std
+        sp["metrics_df"] = df
+        res["spatial"] = sp
+        return res, list(df.columns).index("AUC_std")
+
+    def test_single_repeat_std_is_blank_with_note(self, result):
+        t = ResultsTab()
+        res, col = self._res(result, float("nan"))
+        t.set_result(res)
+        _ok(t)
+        assert t.metrics_table.item(0, col).text() == ""                 # NaN bo'sh katak ("0.000" emas)
+        assert not t.std_note.isHidden() and "1 takror: std aniqlanmagan" in t.std_note.text()
+
+    def test_defined_std_shows_no_note(self, result):
+        t = ResultsTab()
+        res, col = self._res(result, 0.0123)
+        t.set_result(res)
+        assert t.metrics_table.item(0, col).text() == "0.012"
+        assert t.std_note.isHidden() and t.std_note.text() == ""
+        t.set_result(self._res(result, float("nan"))[0])                 # qayta NaN => izoh qaytadi
+        assert not t.std_note.isHidden()
+        t.clear()
+        assert t.std_note.isHidden()
+
+
+class TestImportanceNoRelabelHack:
+    def test_relabel_hack_removed_and_plots_handle_mdi(self):
+        assert not hasattr(rt, "_relabel_mdi") and not hasattr(rt, "_draw_importance")
+        res = {"feature_names": ["a", "b", "c"],
+               "importance": {"method": "mdi", "feature_names": ["a", "b", "c"], "models": {
+                   "RandomForest": {"mean": [0.1, 0.5, 0.2], "std": [0.0, 0.0, 0.0], "source": "mdi"}}}}
+        t = ImportanceTab()
+        t.set_result(res)
+        _ok(t)
+        titles = " ".join(a.get_title() for a in t.imp_canvas.fig.axes)
+        assert "MDI/gain importance (zaxira)" in titles                  # plots.draw_importance o'zi to'g'ri yozadi
+        assert "MDI" in t.imp_canvas.fig.axes[0].get_xlabel()
+        assert "MDI/gain importance (zaxira)" in " ".join(a.get_title() for a in t.figures()["importance"].axes)

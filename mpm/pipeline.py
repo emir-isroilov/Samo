@@ -25,8 +25,8 @@ import pandas as pd
 
 from . import __version__ as MPM_VERSION
 from . import spatial
-from .common import (ENSEMBLE_NAME, CancelledError, check_cancel, collect_versions, get_xgboost, noop_log,
-                     set_global_seed, sub_progress, tf_available)
+from .common import (ENSEMBLE_NAME, CancelledError, check_cancel, collect_versions, get_tf, get_xgboost,
+                     import_error, noop_log, set_global_seed, sub_progress, tf_available)
 from .config import PARAM_SPECS, RunConfig, hp_summary_text, validate_hyperparams
 from .cv import compute_metrics, metrics_dataframe, run_background_sensitivity, run_cv
 from .data import (FeaturePipeline, build_data_dictionary, build_dataset, data_diagnostics, dedupe_points_by_pixel,
@@ -49,6 +49,10 @@ _WARN_RE = re.compile(r"ogohlantirish\s*:\s*(.*)", re.IGNORECASE)
 _LOG_RE = re.compile(r"^mpm_run_(\d+)\.log$")
 _NOTE_CNN = ("CNN chiqishi kalibrlanmaydi va neg/pos namuna og'irligi bilan o'qitiladi, ansambl esa oddiy o'rtacha: "
              "CNN ehtimolliklari boshqa modellar bilan bir shkalada bo'lmasligi mumkin.")
+_NOTE_TUNING_NOT_NESTED = (
+    "tuning rejimi '{mode}' (nested emas): CV metrikalari bazaviy giperparametrlar bilan hisoblandi, yakuniy model esa "
+    "tuned hp bilan o'qitiladi - CV metrikalari yakuniy modelning sifatini aks ettirmaydi (tuning ta'siri baholanmaydi). "
+    "Tuning ta'sirini halol baholash uchun 'nested' rejimini tanlang.")
 _NOTE_INDEX = ("Chiqish - prospektivlik indeksi (0-1), ehtimollik EMAS: musbat:fon nisbati sun'iy tanlangan, "
                "shuning uchun qiymatlar haqiqiy kon topish ehtimolini bildirmaydi, faqat nisbiy tartib beradi.")
 
@@ -153,6 +157,16 @@ class _Ctx:
             self.timings[key] = self.timings.get(key, 0.0) + time.perf_counter() - t0
 
 
+def _unavailable_text(label, modname, what):
+    """Kutubxona yo'qligi / import yiqilganligi haqida aniq xabar: modul topilgan, lekin import xato bergan bo'lsa
+    (buzilgan TF/xgboost/shap) "o'rnatilmagan" EMAS, modul nomi + haqiqiy xato ko'rsatiladi (common.import_error)."""
+    err = import_error(modname)
+    if err:
+        return (f"{label}: '{modname}' moduli o'rnatilgan, lekin import qilib bo'lmadi ({err}); paketni qayta "
+                f"o'rnating yoki versiyalarni tekshiring. {what} o'tkazib yuboriladi.")
+    return f"{label} o'rnatilmagan ('pip install {modname}'), {what} o'tkazib yuboriladi."
+
+
 def _prefixed(log, prefix):
     return lambda msg="": log(f"    [{prefix}] {str(msg).strip()}")
 
@@ -195,10 +209,10 @@ def _prepare(cfg, ctx):
     names = []
     for m in cfg.enabled_models():
         if m == "XGBoost" and get_xgboost() is None:
-            ctx.warn("XGBoost o'rnatilmagan ('pip install xgboost'), XGBoost o'tkazib yuboriladi.")
+            ctx.warn(_unavailable_text("XGBoost", "xgboost", "XGBoost"))
             cfg.use_models["XGBoost"] = False
-        elif m == "CNN" and not tf_available():
-            ctx.warn("TensorFlow o'rnatilmagan ('pip install tensorflow'), CNN o'tkazib yuboriladi.")
+        elif m == "CNN" and (not tf_available() or get_tf() is None):
+            ctx.warn(_unavailable_text("TensorFlow", "tensorflow", "CNN"))
             cfg.use_models["CNN"] = False
         else:
             names.append(m)
@@ -207,6 +221,8 @@ def _prepare(cfg, ctx):
                          "Kamida bitta mavjud modelni (RandomForest/SVM) yoqing.")
     if cfg.tuning.enabled and not _tune_names(cfg, names):
         ctx.warn("tuning yoqilgan, lekin mavjud modellar orasida tuning uchun belgilangani yo'q: tuning bajarilmaydi.")
+    elif _tune_names(cfg, names) and cfg.tuning.mode != "nested":
+        ctx.warn(_NOTE_TUNING_NOT_NESTED.format(mode=cfg.tuning.mode))
     ctx.log("Modellar: " + ", ".join(names))
     ctx.log("Giperparametrlar (CV va yakuniy model uchun yagona manba):\n" + hp_summary_text(hp, names))
     if "CNN" in names and len(names) > 1:
@@ -218,28 +234,6 @@ def _prepare(cfg, ctx):
 # ---------------------------------------------------------------------------
 # Ma'lumotlar bosqichi
 # ---------------------------------------------------------------------------
-def _check_metadata_csv(folder, ctx):
-    """metadata.csv ajratgichi (';') yoki kodlash (cp1251) muammosini oldindan aniqlaydi va aniq maslahat beradi."""
-    path = os.path.join(folder, "metadata.csv")
-    if not os.path.isfile(path):
-        return
-    try:
-        with open(path, "rb") as f:
-            raw = f.read(65536)
-    except OSError:
-        return
-    hint = ("metadata.csv vergul (,) bilan ajratilgan va UTF-8 kodlashda bo'lishi kerak. Excel ba'zan ';' ajratgich "
-            "va cp1251 kodlash bilan saqlaydi: 'CSV UTF-8 (vergul bilan ajratilgan)' formatida qayta saqlang.")
-    try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        ctx.warn("metadata.csv UTF-8 emas (cp1251 bo'lishi mumkin) - o'qib bo'lmaydi. " + hint)
-        return
-    header = text.splitlines()[0] if text.strip() else ""
-    if ";" in header and "," not in header:
-        ctx.warn("metadata.csv ';' ajratgich bilan yozilgan - ustunlar tanilmaydi. " + hint)
-
-
 def _load_data(cfg, ctx, hp, names):
     """Rasterlar -> metadata -> FeaturePipeline -> nuqtalar -> fon -> Dataset -> diagnostika."""
     tiff_paths = find_tiff_files(cfg.tiff_folder)
@@ -260,7 +254,6 @@ def _load_data(cfg, ctx, hp, names):
                                         assume_crs_if_missing=cfg.assume_crs_if_missing, cancel=ctx.cancel)
         ctx.report(0.06, "Rasterlar yuklandi")
         ctx.check()
-        _check_metadata_csv(cfg.tiff_folder, ctx)
         manual, meta_path = load_or_create_manual_metadata(cfg.tiff_folder, raster.band_names, log_fn=ctx.log)
         data_dictionary = build_data_dictionary(raster.band_names, raster.tech_metadata, manual)
         n_inc = sum(1 for b in raster.band_names if not str((manual.get(b) or {}).get("source_owner", "")).strip())
@@ -292,7 +285,8 @@ def _load_data(cfg, ctx, hp, names):
                 f"min. masofa={cfg.min_distance:g} m.")
         background_gdf = generate_background_points(
             aoi_gdf, positive_gdf, cfg.n_background, cfg.min_distance, random_state=cfg.seed,
-            strategy=cfg.background_strategy, valid_mask=valid, transform=raster.transform, log_fn=ctx.log)
+            strategy=cfg.background_strategy, valid_mask=valid, transform=raster.transform, log_fn=ctx.log,
+            cancel=ctx.cancel)
         need_fs = "CNN" in names and hp["CNN"]["mode"] == "patch2d"
         dataset = build_dataset(raster, fpipe, positive_gdf, background_gdf, log_fn=ctx.log, need_feature_stack=need_fs)
         if dataset.n_pos < MIN_POSITIVE:
@@ -383,7 +377,7 @@ def _block_size(cfg, ctx, raster, dataset, hp, names):
 # ---------------------------------------------------------------------------
 def _cv_block(cv_res, dataset, groups, cfg, ctx, label):
     metrics, ens = compute_metrics(dataset.y, cv_res["oof"], groups, n_boot=cfg.n_bootstrap, seed=cfg.seed,
-                                   log_fn=ctx.log)
+                                   log_fn=ctx.log, cancel=ctx.cancel)
     for w in cv_res.get("warnings", []):
         ctx.warn(f"{label} CV: {w}")
     return {"mode": cv_res["mode"], "oof": cv_res["oof"], "metrics": metrics,
@@ -578,6 +572,7 @@ def _importance(cfg, ctx, names, spatial_block, final_models, feature_names):
     p = len(feature_names)
     models, via_perm, via_mdi = {}, [], []
     for m in names:
+        ctx.check()
         pi = perm.get(m)
         if pi is not None and np.size(pi.get("mean")) == p and np.isfinite(pi["mean"]).any():
             models[m] = {"mean": np.asarray(pi["mean"], dtype=float), "std": np.asarray(pi["std"], dtype=float),
@@ -622,6 +617,8 @@ def _shap(cfg, ctx, final_models, dataset):
     except Exception as e:
         ctx.warn(f"SHAP hisoblanmadi ({type(e).__name__}: {e}).")
         return None
+    if not out and import_error("shap"):
+        ctx.warn(_unavailable_text("SHAP", "shap", "SHAP"))
     if out:
         ctx.log("  Eslatma: SHAP birliklari modelga bog'liq (RF: ehtimollik, XGBoost: log-odds) - "
                 "modellararo magnitudani bitta o'qda solishtirmang.")
@@ -631,11 +628,29 @@ def _shap(cfg, ctx, final_models, dataset):
 # ---------------------------------------------------------------------------
 # run_training
 # ---------------------------------------------------------------------------
+def _check_out_dir(path, what="Chiqish papkasi"):
+    """Papkani yaratib, unga yozish mumkinligini hisoblashdan OLDIN tekshiradi (aks holda ish oxirida yo'qoladi)."""
+    if not path:
+        return
+    import tempfile
+    try:
+        os.makedirs(path, exist_ok=True)
+        with tempfile.TemporaryFile(dir=path):
+            pass
+    except OSError as e:
+        raise ValueError(f"{what} yozib bo'lmaydi yoki yaratib bo'lmaydi: {path} ({e}). "
+                         f"Boshqa papka tanlang.") from e
+
+
 def run_training(cfg, *, log_fn=None, progress_fn=None, cancel=None):
     """To'liq o'qitish ish oqimi. Qaytaradi: TrainingResult (docs/ARCHITECTURE.md 3.8). cfg.validate() muammolari =>
-    ValueError. Bekor qilinsa CancelledError (xom) ko'tariladi. Log fayli: <cfg.output_dir>/mpm_run_<N>.log (UTF-8)."""
+    ValueError. Bekor qilinsa CancelledError (xom) ko'tariladi. Log fayli: <cfg.output_dir>/mpm_run_<N>.log (UTF-8).
+    Bekor qilish nuqtalari: barcha bosqichlar, importance (har model) va importance -> SHAP orasida hamda SHAP ichida.
+    SHAP tugagach esa yakunlash (bo'sag'lar, vaqtlar, natija lug'ati) bekor qilinmaydi: ishning ~99% bajarilgan, shuning
+    uchun shu paytda Stop bosilsa ham tayyor natija qaytariladi (CancelledError EMAS)."""
     ctx = _Ctx(log_fn, progress_fn, cancel)
     try:
+        _check_out_dir(getattr(cfg, "output_dir", ""))
         return _run_training(cfg, ctx)
     except CancelledError:
         ctx.log("Hisoblash foydalanuvchi tomonidan to'xtatildi.")
@@ -671,7 +686,8 @@ def _run_training(cfg, ctx):
                 block_size=block_size, n_draws=cfg.bg_sensitivity_draws, n_splits=cfg.n_splits,
                 n_repeats=cfg.bg_sensitivity_repeats, calibrate=cfg.calibrate,
                 calibration_method=cfg.calibration_method, calibration_cv=cfg.calibration_cv, n_jobs=cfg.n_jobs,
-                seed=cfg.seed, log_fn=ctx.log, progress_fn=ctx.prog(0.70, 0.80), cancel=ctx.cancel)
+                seed=cfg.seed, log_fn=ctx.log, progress_fn=ctx.prog(0.70, 0.80), cancel=ctx.cancel,
+                feature_stack=dataset.feature_stack)            # CNN patch2d: stek draw'lar orasida qayta ishlatiladi
     ctx.report(0.80, "Fon sezgirligi tugadi" if cfg.bg_sensitivity_enabled else "Fon sezgirligi o'chirilgan")
 
     with ctx.stage("final_fit"):
@@ -682,7 +698,10 @@ def _run_training(cfg, ctx):
         ctx.report(0.92, "Importance hisoblanmoqda")
         importance = _importance(cfg, ctx, names, spatial_block, final_models, dataset.feature_names)
         ctx.report(0.95, "SHAP hisoblanmoqda")
+        ctx.check()                      # importance va SHAP orasida: Stop shu yerda ham ishlaydi
         shap_res = _shap(cfg, ctx, final_models, dataset)
+        # BEKOR QILISH QARORI: SHAP tugagach (ishning ~99%) check_cancel CHAQIRILMAYDI - qolgani soniyalik yakunlash
+        # (bo'sag'lar, vaqtlar); Stop shu paytda bosilsa ham tayyor natija saqlanib qaytariladi (yo'qotilmaydi).
         thresholds = {name: float(m["threshold_youden"]) for name, m in spatial_block["metrics"].items()}
         ctx.log("Youden bo'sag'lari (spatial OOF): " + ", ".join(f"{k}={v:.3f}" for k, v in thresholds.items()))
         ctx.report(0.98, "Importance tayyor")
@@ -716,6 +735,7 @@ def run_prediction(result, *, out_dir=None, class_method=None, n_classes=None, c
     class_* berilmasa result["cfg"] dan olinadi. out_dir bo'lsa GeoTIFF'lar va predictor_data_dictionary.csv saqlanadi.
     Qaytaradi: {"maps","uncertainty","valid_mask","class_map","class_breaks","class_stats","success_curve","saved_paths"}."""
     log = log_fn or noop_log
+    _check_out_dir(out_dir)
     cfg = result.get("cfg") or {}
     method = class_method or cfg.get("class_method") or "quantile"
     ncls = int(n_classes if n_classes is not None else cfg.get("n_classes", 5))
@@ -842,6 +862,35 @@ def _fold_table_df(result):
     return pd.concat(parts, ignore_index=True)
 
 
+def _num_text(v, spec):
+    """Son (None/NaN => '-') ni spec bo'yicha formatlaydi; son bo'lmasa str()."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "-" if v is None else str(v)
+    return format(f, spec) if math.isfinite(f) else "-"
+
+
+def _params_text(params):
+    """best_params -> 'k=v, ...': float'lar {:.4g}, qolganlari o'z holicha (numpy skalyarlari ham)."""
+    if not isinstance(params, dict):
+        return "-" if params is None else str(params)
+    parts = []
+    for k, v in params.items():
+        v = v.item() if isinstance(v, np.generic) else v
+        parts.append(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}")
+    return ", ".join(parts)
+
+
+def _std_text(std):
+    """Repeat-std: chekli bo'lsa '+/- 0.012', NaN (1 repeat) bo'lsa '(std: -, 1 takror)'."""
+    try:
+        f = float(std)
+    except (TypeError, ValueError):
+        f = float("nan")
+    return f"+/- {f:.3f}" if math.isfinite(f) else "(std: -, 1 takror)"
+
+
 def _summary_text(result, prediction):
     cfg = result.get("cfg") or {}
     sp = result["spatial"]
@@ -858,7 +907,7 @@ def _summary_text(result, prediction):
     for name, m in sp["metrics"].items():
         lo, hi = m["auc_ci95"]
         ci = f"95% CI {lo:.3f}-{hi:.3f}" if np.isfinite(lo) and np.isfinite(hi) else "CI hisoblanmadi"
-        lines.append(f"  {name}: AUC={m['auc']:.3f} +/- {m['auc_std']:.3f} ({ci}), PR-AUC={m['pr_auc']:.3f}, "
+        lines.append(f"  {name}: AUC={m['auc']:.3f} {_std_text(m.get('auc_std'))} ({ci}), PR-AUC={m['pr_auc']:.3f}, "
                      f"Sens/Spec@Youden={m['sensitivity']:.2f}/{m['specificity']:.2f}, Brier={m['brier']:.3f}")
     lines.append("  Eslatma: AUC - repeat'lar o'rtachasi; CI esa mean-proba ustida blok-bootstrap bilan topilgan, "
                  "shuning uchun nuqtaviy qiymat CI chetiga yaqin bo'lishi mumkin.")
@@ -868,11 +917,18 @@ def _summary_text(result, prediction):
         for name, m in sp["metrics"].items():
             r = rnd["metrics"].get(name, {}).get("auc", float("nan"))
             lines.append(f"  {name}: random AUC={r:.3f}, spatial AUC={m['auc']:.3f}, farq={r - m['auc']:+.3f}")
+        if any(sp.get("tuned_params", {}).values()):
+            lines.append("  Eslatma: random CV bazaviy giperparametrlar bilan, spatial CV esa nested tuning bilan "
+                         "baholandi - 'optimizm' (farq) qisman tuning farqi bo'lishi mumkin, faqat leakage emas.")
+        elif result.get("final_tuning"):
+            lines.append("  Eslatma: ikkala CV ham bazaviy giperparametrlar bilan baholandi; yakuniy model tuned hp "
+                         "bilan o'qitilgan (tuning CV'da baholanmagan, nested emas).")
     bg = result.get("bg_sensitivity")
     if bg:
         lines += ["", f"Fon tanloviga sezgirlik ({bg.get('n_draws')} ta tanlov):"]
         for name, s in bg["summary"].items():
-            lines.append(f"  {name}: AUC {s['mean']:.3f} +/- {s['std']:.3f} [{s['min']:.3f}-{s['max']:.3f}]")
+            std = f"+/- {s['std']:.3f}" if len(s.get("values") or []) > 1 else "(1 tanlov: std yo'q)"
+            lines.append(f"  {name}: AUC {s['mean']:.3f} {std} [{s['min']:.3f}-{s['max']:.3f}]")
     imp = result.get("importance") or {}
     if imp.get("models"):
         lines += ["", f"Feature importance - {imp.get('method')}; eng muhim 5 ta:"]
@@ -885,7 +941,8 @@ def _summary_text(result, prediction):
     if ft:
         lines += ["", "Yakuniy giperparametr qidiruvi:"]
         for m, rec in ft.items():
-            lines.append(f"  {m}: {rec.get('scoring')}={rec.get('best_score')} ; {rec.get('best_params')}")
+            lines.append(f"  {m}: {rec.get('scoring')}={_num_text(rec.get('best_score'), '.4f')} ; "
+                         f"{_params_text(rec.get('best_params'))}")
     if prediction is not None:
         cs = prediction.get("success_curve") or {}
         lines += ["", f"Prognoz: {prediction.get('n_classes')} sinf, success-rate AUC={cs.get('auc', float('nan')):.3f} "
@@ -938,7 +995,8 @@ def export_results(result, out_dir, prediction=None, log_fn=None):
     cfg = result.get("cfg") or {}
     js("hyperparameters_used.json", {"base": (cfg.get("hyperparams") or {}), "final": result.get("final_hyperparams"),
                                      "tuning": cfg.get("tuning"), "models": result.get("model_names")})
-    js("run_config.json", {**cfg, "band_names": result["band_names"], "block_size": result["block_size"],
+    js("run_config.json", {**cfg, "kind": "run_config", "band_names": result["band_names"],
+                           "block_size_used": result["block_size"],
                            "n_positive": result["n_positive"], "n_background": result["n_background"],
                            "mpm_version": MPM_VERSION})
     imp = _importance_df(result)

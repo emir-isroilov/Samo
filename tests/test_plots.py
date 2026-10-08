@@ -920,7 +920,8 @@ def test_tuning_real(tuned, tmp_path):
     plots.draw_tuning_trials(fig, tuned)
     assert_ok(fig)
     titles = [ax.get_title() for ax in fig.axes]
-    assert any("RandomForest" in t for t in titles) and any("SVM" in t for t in titles)
+    assert has_text(fig, "RandomForest") and has_text(fig, "SVM")          # model nomi - qator yorlig'i
+    assert not any("RandomForest" in t or "SVM" in t for t in titles)      # panel sarlavhasida takrorlanmaydi
     assert any("roc_auc" in t for t in titles)                # har model uchun ball paneli
     assert any(t.endswith("C") for t in titles)               # SVM.C o'zgargan parametr
     assert "Giperparametr" in fig._suptitle.get_text()
@@ -1068,7 +1069,7 @@ def test_tuning_many_panels_fit_small_canvas(tmp_path):
     big = new_fig(12, 12)
     plots.draw_tuning_trials(big, tp)
     assert_ok(big)
-    assert len(big.axes) == 3 * (1 + 8)
+    assert len([ax for ax in big.axes if ax.get_title()]) == 3 * (1 + 8)        # + 3 ta model yorlig'i axes'i
     assert not has_text(big, "ko'rsatilmadi")
 
 
@@ -1139,3 +1140,255 @@ def test_no_forbidden_imports():
             pytest.fail("print ishlatilmasin")
     bad = [m for m in mods if m.split(".")[0] in ("PyQt5", "tensorflow", "shap", "xgboost") or m == "matplotlib.pyplot"]
     assert not bad, bad
+
+
+# ---------------------------------------------------------------------------
+# Yakuniy mustahkamlash regressiyalari (importance MDI, xarita, tuning sarlavhalari, std/CI legend)
+# ---------------------------------------------------------------------------
+def _imp_res(sources, names=None, p=6):
+    rng = np.random.default_rng(0)
+    models = {}
+    for k, src in sources.items():
+        models[k] = {"mean": rng.random(p), "std": np.zeros(p) if src == "mdi" else rng.random(p) * 0.05 + 0.01,
+                     "n_folds": 3, "n_valid_folds": 3, "source": src}
+    return {"importance": {"method": "m", "models": models,
+                           "feature_names": names if names is not None else [f"b{i}" for i in range(p)]}}
+
+
+def test_importance_mdi_source_title_label_no_errorbars():
+    res = _imp_res({"RandomForest": "permutation", "XGBoost": "mdi"})
+    fig = new_fig(10, 6)
+    plots.draw_importance(fig, res)
+    assert_ok(fig)
+    perm_ax, mdi_ax = fig.axes[0], fig.axes[1]
+    assert "Permutation importance" in perm_ax.get_title() and "ΔAUC" in perm_ax.get_xlabel()
+    assert any(getattr(c, "errorbar", None) is not None for c in perm_ax.containers)
+    assert "MDI/gain importance (zaxira)" in mdi_ax.get_title()
+    assert "Permutation" not in mdi_ax.get_title()
+    assert "ΔAUC" not in mdi_ax.get_xlabel() and "MDI" in mdi_ax.get_xlabel()
+    assert not any(getattr(c, "errorbar", None) is not None for c in mdi_ax.containers)    # std nol - xato chizig'i yo'q
+
+
+def test_importance_mdi_top_n_suffix_and_no_relabel_hack():
+    """draw_importance 'source' ni o'zi hisobga oladi: result_tabs'dagi vaqtinchalik _relabel_mdi hack'i olib tashlandi."""
+    res = _imp_res({"XGBoost": "mdi"}, p=45)
+    fig = new_fig()
+    plots.draw_importance(fig, res)
+    assert "MDI/gain importance (zaxira)" in fig.axes[0].get_title() and "20/45" in fig.axes[0].get_title()
+    assert "MDI" in fig.axes[0].get_xlabel()
+    pytest.importorskip("PyQt5")
+    from mpm.gui import result_tabs
+    assert not hasattr(result_tabs, "_relabel_mdi")
+
+
+def test_importance_numpy_feature_names():
+    names = np.array([f"band_{i}" for i in range(6)])
+    res = _imp_res({"RandomForest": "permutation"}, names=names)
+    res["shap"] = {"RandomForest": dict(manual_shap(p=6), feature_names=np.array([f"s{i}" for i in range(6)]))}
+    fig = new_fig()
+    plots.draw_importance(fig, res)
+    assert_ok(fig)
+    assert len(fig.axes) == 2
+    assert {t.get_text() for t in fig.axes[0].get_yticklabels()} == set(names)
+    assert {t.get_text() for t in fig.axes[1].get_yticklabels()} == {f"s{i}" for i in range(6)}
+    res2 = {"feature_names": names, "importance": {"models": res["importance"]["models"], "feature_names": np.array([])}}
+    fig = new_fig()
+    plots.draw_importance(fig, res2)
+    assert_ok(fig)
+    fig = new_fig()
+    sh = dict(manual_shap(p=6), feature_names=np.array(list("abcdef")))
+    plots.draw_shap_beeswarm(fig, {"shap": {"RandomForest": sh}}, "RandomForest")
+    assert_ok(fig)
+
+
+def _group_extent(fig):
+    """map axes + colorbar guruhining (tick yorliqlarsiz, axes qutilari) gorizontal chegaralari, figura nisbatida."""
+    fig.canvas.draw()
+    boxes = [ax.get_position() for ax in fig.axes]
+    return min(b.x0 for b in boxes), max(b.x1 for b in boxes)
+
+
+@pytest.mark.parametrize("canvas", [(6, 6), (11.6, 6), (4, 7), (16, 4.5)])
+@pytest.mark.parametrize("shape", [(100, 100), (60, 120), (140, 60)])
+def test_map_group_centered_on_any_canvas(canvas, shape):
+    arr = np.random.default_rng(0).random(shape)
+    t = from_origin(11_500_000.0, 4_600_000.0 + shape[0] * 100, 100.0, 100.0)
+    fig = new_fig(*canvas)
+    plots.draw_map(fig, arr, t, "Xarita", cbar_label=plots.INDEX_LABEL)
+    assert_ok(fig)
+    ax, cax = fig.axes[0], fig.axes[1]
+    fig.canvas.draw()
+    a, c = ax.get_position(), cax.get_position()
+    fw, fh = fig.get_size_inches()
+    assert a.width * fw / (a.height * fh) == pytest.approx(shape[1] / shape[0], rel=0.02)      # equal-aspect saqlanadi
+    assert c.x0 >= a.x1 - 1e-6 and (c.x0 - a.x1) * fw < 0.6                                  # colorbar axes'ga yopishgan
+    assert c.height == pytest.approx(a.height, rel=0.05)                                     # va balandligi teng
+    x0, x1 = _group_extent(fig)
+    left, right = x0, 1.0 - x1                                                                 # chap/o'ng bo'sh joy
+    assert abs(left - right) * fw < 0.9, (canvas, shape, left * fw, right * fw)               # markazlashgan (kvadrat tick yorliqlari farqi)
+    assert_inside(fig)
+
+
+def test_map_wide_canvas_no_big_left_gap():
+    """Regressiya: 11.6x6 da xarita+colorbar o'ngga siljib, chapda katta bo'sh joy qolardi."""
+    arr = np.random.default_rng(0).random((100, 100))
+    t = from_origin(11_500_000.0, 4_610_000.0, 100.0, 100.0)
+    fig = new_fig(11.6, 6)
+    plots.draw_map(fig, arr, t, "Xarita", cbar_label="x")
+    fig.canvas.draw()
+    r = fig.canvas.get_renderer()
+    tb = [ax.get_tightbbox(r) for ax in fig.axes]
+    left = min(b.x0 for b in tb)
+    right = fig.bbox.x1 - max(b.x1 for b in tb)
+    assert abs(left - right) < 0.6 * fig.dpi, (left, right)
+    assert left > 0.5 * fig.dpi                                  # yon bo'sh joylar bor (xarita cho'zilmaydi)
+
+
+def test_map_huge_array_is_strided_and_fast():
+    import time
+    big = np.zeros((4000, 4000), dtype=np.float32)
+    big[::3] = 0.5
+    big[:100] = np.nan
+    t = from_origin(11_500_000.0, 4_640_000.0, 10.0, 10.0)
+    fig = new_fig()
+    t0 = time.perf_counter()
+    plots.draw_map(fig, big, t, "Katta", cbar_label="x")
+    fig.canvas.draw()
+    assert time.perf_counter() - t0 < 20
+    assert_ok(fig)
+    im = fig.axes[0].images[0]
+    assert max(im.get_array().shape) <= plots.MAP_MAX_PX
+    l, r, b, tp = im.get_extent()                               # extent to'liq raster bo'yicha qoladi
+    assert (l, tp) == (t.c, t.f) and r == pytest.approx(t.c + 4000 * 10.0) and b == pytest.approx(t.f - 4000 * 10.0)
+    # stride'da yo'qolib qoladigan siyrak yaroqli piksel: "Ma'lumot yo'q" EMAS
+    sp = np.full((5000, 5000), np.nan)
+    sp[1, 1] = 0.7
+    fig = new_fig()
+    plots.draw_map(fig, sp, None, "t")
+    assert_ok(fig)
+
+
+def test_tuning_titles_are_param_names_and_model_in_row_label():
+    recs = []
+    for f in range(3):
+        best = {"n_estimators": [100, 300, 500][f], "min_samples_leaf": [1, 2, 4][f], "max_features": ["sqrt", "log2", "sqrt"][f]}
+        recs.append({"repeat": 0, "fold": f, "best_params": best, "best_score": 0.8, "base_score": 0.7, "scoring": "roc_auc",
+                     "n_trials": 2, "trials": [{"params": dict(best, n_estimators=100 + k), "score": 0.7} for k in range(2)]})
+    fb = dict(recs[2], fallback="zaxira")
+    tp = {"RandomForest": recs[:2] + [fb], "XGBoost": recs}
+    for size in ((8, 6), (6, 8), (11, 7)):
+        fig = new_fig(*size)
+        plots.draw_tuning_trials(fig, tp)
+        assert_ok(fig)
+        titles = [ax.get_title() for ax in fig.axes if ax.get_title()]
+        assert "n_estimators" in titles and "min_samples_leaf" in titles and "max_features" in titles
+        assert not any("RandomForest" in t or "XGBoost" in t or "·" in t for t in titles)
+        assert has_text(fig, "RandomForest") and has_text(fig, "XGBoost")
+        assert has_text(fig, "1/3 fold zaxira")
+        fig.canvas.draw()
+        r = fig.canvas.get_renderer()
+        for ax in fig.axes:
+            if not ax.get_title():
+                continue
+            tb = ax.title.get_window_extent(r)
+            ab = ax.get_window_extent(r)
+            assert tb.x0 >= ab.x0 - 0.6 * fig.dpi / 10 and tb.x1 <= ab.x1 + 0.6 * fig.dpi / 10, (size, ax.get_title())
+        assert_inside(fig)
+
+
+def test_legends_omit_undefined_std_and_ci():
+    m = manual_metrics()
+    for v in m.values():
+        v["auc_std"] = float("nan")
+        v["pr_auc_std"] = float("nan")
+        v["pr_auc_ci95"] = (float("nan"), float("nan"))
+    fig = new_fig()
+    plots.draw_roc(fig, m)
+    labs = [t.get_text() for t in fig.axes[0].get_legend().get_texts()]
+    assert all("±" not in x and "0.000" not in x for x in labs), labs
+    assert any("95% CI 0.700–0.900" in x for x in labs)                    # CI bor - ko'rsatiladi
+    assert "±" not in fig.axes[0].get_legend().get_title().get_text()
+    fig = new_fig()
+    plots.draw_pr(fig, m, None)
+    labs = [t.get_text() for t in fig.axes[0].get_legend().get_texts()]
+    assert all("±" not in x and "CI" not in x for x in labs), labs
+    # std va CI ikkalasi NaN: legend sarlavhasi ham yo'q
+    m2 = manual_metrics(with_ci=False)
+    for v in m2.values():
+        v["auc_std"] = float("nan")
+    fig = new_fig()
+    plots.draw_roc(fig, m2)
+    lg = fig.axes[0].get_legend()
+    assert all("±" not in t.get_text() and "CI" not in t.get_text() for t in lg.get_texts())
+    assert lg.get_title().get_text() == ""
+    # std chekli bo'lsa avvalgidek
+    fig = new_fig()
+    plots.draw_roc(fig, manual_metrics())
+    assert any("± 0.010" in t.get_text() for t in fig.axes[0].get_legend().get_texts())
+
+
+def test_single_repeat_std_not_shown_even_if_zero():
+    """cv bitta takrorda std=0.0 qaytarishi mumkin (auc_repeats uzunligi 1): "± 0.000" yozilmasin."""
+    m = manual_metrics()
+    for v in m.values():
+        v["auc_std"] = 0.0
+        v["auc_repeats"] = np.array([0.8])
+    fig = new_fig()
+    plots.draw_roc(fig, m)
+    assert all("±" not in t.get_text() for t in fig.axes[0].get_legend().get_texts())
+    for v in m.values():
+        v["auc_repeats"] = np.array([0.8, 0.82])
+        v["auc_std"] = 0.014
+    fig = new_fig()
+    plots.draw_roc(fig, m)
+    assert any("± 0.014" in t.get_text() for t in fig.axes[0].get_legend().get_texts())
+
+
+def test_spatial_bars_no_errorbar_when_std_and_ci_undefined():
+    nan = float("nan")
+    sm = {"A": {"auc": 0.8, "auc_std": nan, "auc_ci95": (nan, nan)}}
+    res = {"spatial": {"metrics": sm}, "bg_sensitivity": {"n_draws": 1, "summary": {
+        "A": {"mean": 0.8, "std": 0.0, "min": 0.78, "max": 0.82}}}}
+    fig = new_fig(10, 5)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        plots.draw_spatial_diagnostics(fig, res)
+        fig.canvas.draw()
+    assert_ok(fig)
+    bars_ax, bg_ax = fig.axes[0], fig.axes[1]
+    assert not any(getattr(c, "errorbar", None) is not None for c in bars_ax.containers if hasattr(c, "errorbar")) \
+        or all(c.errorbar is None for c in bars_ax.containers if hasattr(c, "errorbar"))
+    assert not any(isinstance(c, type(bars_ax.containers[0])) and getattr(c, "errorbar", None) for c in bg_ax.containers)
+
+
+# ---------------------------------------------------------------------------
+# e2e tuzatishlari: korrelyatsiya heatmap markazlashishi, chalkashlik matritsasi yorliqlari
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("canvas", [(11.6, 6), (16, 4.5), (6, 6)])
+def test_corr_heatmap_group_centered_on_wide_canvas(canvas):
+    """Regressiya: keng canvasda kvadrat heatmap + colorbar o'ngga siljib, chapda katta bo'sh joy qolardi."""
+    rng = np.random.default_rng(1)
+    X = rng.normal(size=(200, 7))
+    corr = pd.DataFrame(np.corrcoef(X.T), columns=[f"layer{i}" for i in range(7)])
+    fig = new_fig(*canvas)
+    plots.draw_corr_heatmap(fig, corr)
+    assert_ok(fig)
+    fw, _fh = fig.get_size_inches()
+    x0, x1 = _group_extent(fig)
+    assert abs(x0 - (1.0 - x1)) * fw < 1.2, (canvas, x0 * fw, (1.0 - x1) * fw)       # tick yorliqlari farqi ichida
+
+
+def test_confusion_tick_labels_are_two_lines_and_do_not_overlap():
+    """Regressiya: tor canvasda "Bashorat: fon (0)" va "Bashorat: musbat (1)" yorliqlari bir-birining ustiga tushardi."""
+    ms = {"RandomForest": {"confusion": [[71, 9], [3, 25]], "sensitivity": 0.89, "specificity": 0.89,
+                           "threshold_youden": 0.3}}
+    fig = new_fig(6, 4)
+    plots.draw_confusion(fig, ms, "RandomForest")
+    assert_ok(fig)
+    ax = fig.axes[0]
+    xt = [t.get_text() for t in ax.get_xticklabels()]
+    assert all("\n" in t for t in xt) and all("\n" in t.get_text() for t in ax.get_yticklabels())
+    fig.canvas.draw()
+    r = fig.canvas.get_renderer()
+    b0, b1 = [t.get_window_extent(r) for t in ax.get_xticklabels()]
+    assert b0.x1 <= b1.x0 + 1.0                                                      # yonma-yon yorliqlar kesishmaydi

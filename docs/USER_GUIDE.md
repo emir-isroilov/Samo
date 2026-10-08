@@ -162,8 +162,10 @@ Ustunlar (birinchi qator — sarlavha):
 | `transformation_applied` | qo'llangan qayta ishlash (filtr, normallashtirish...) |
 | `notes` | izoh |
 
-Talablar: **UTF-8** kodlash, ajratgich — **vergul** (`,`). Excel ba'zan `;` ajratgich va cp1251 kodlash bilan saqlaydi: dastur
-buni aniqlab ogohlantiradi; "CSV UTF-8 (vergul bilan ajratilgan)" formatida qayta saqlang. `source_owner` bo'sh qatlamlar soni
+Tavsiya: **UTF-8** kodlash, ajratgich — **vergul** (`,`). Excel mintaqaviy sozlamasiga qarab `;` ajratgich va cp1251/cp1252
+kodlash bilan saqlashi mumkin: dastur ajratgich (`,` yoki `;`) va kodlashni (UTF-8, cp1251, cp1252) **avtomatik aniqlaydi**
+(logda "avtomatik aniqlandi" deb yoziladi). Fayl o'qib bo'lmasa, ogohlantirish chiqadi, fayl esa o'zgartirilmaydi
+("CSV UTF-8" formatida qayta saqlang). `source_owner` bo'sh qatlamlar soni
 ogohlantirishda ko'rsatiladi. Natija — `predictor_data_dictionary.csv`: avtomatik texnik ma'lumotlar (asl CRS, piksel o'lchami,
 qiymatlar statistikasi, valid piksel %) va sizning qo'lda kiritgan ma'lumotlaringiz birga.
 
@@ -215,7 +217,11 @@ print(loyiha["tiff"], loyiha["points"], loyiha["aoi"])      # uchta papka yo'li
 
 ## 4. Dastur oynasi: tablar
 
-Oyna 8 ta tabdan iborat. Uzoq ishlar (o'qitish, prognoz, eksport, bundle'ni qo'llash) alohida oqimda bajariladi — oyna qotmaydi.
+Oyna 8 ta tabdan iborat (sarlavhalar qisqa: **1. Ma'lumotlar**, **2. Giperparametrlar**, **3. Tahlil**, **4. Natijalar**,
+**5. Spatial CV**, **6. Importance**, **7. Xarita**, **8. Modellar**; to'liq nom — sichqonchani sarlavha ustiga olib borganda). Oyna boshlang'ich
+o'lchami ekranga moslanadi (kamida 980x640; 1024x700 ekranda ham hamma tablar sig'adi). Uzoq ishlar (o'qitish, prognoz, eksport, bundle'ni
+qo'llash) alohida oqimda bajariladi — oyna qotmaydi. O'qitish tugagach natija tab'lari **birinchi ochilganda** chiziladi (4-tab darhol,
+qolganlari — ochganingizda, bir soniya ichida), shuning uchun oyna o'qitish tugashi bilan qotib qolmaydi.
 Ish davomida sozlamalar va tugmalar bloklanadi; ish tugagach, xato bo'lsa yoki **To'xtatish (Stop)** bosilsa, hammasi qayta yoqiladi.
 
 Tavsiya etiladigan tartib: **1-tab** (papkalar, sozlamalar) -> **2-tab** (giperparametrlar, ixtiyoriy) -> *(ixtiyoriy)* **3-tab**
@@ -248,7 +254,9 @@ Tavsiya etiladigan tartib: **1-tab** (papkalar, sozlamalar) -> **2-tab** (giperp
   qimmat ekanini oldindan bilish uchun; 10-bo'limga qarang).
 * **Tugmalar:** **O'qitish**; **To'xtatish (Stop)**; **Konfiguratsiyani saqlash/yuklash (JSON)** (barcha sozlamalar — papkalar, CV,
   modellar, giperparametrlar, tuning — bitta faylda). Progress paneli bosqich, foiz, o'tgan vaqt va taxminiy qolgan vaqtni (ETA) ko'rsatadi;
-  ETA butun jarayon bo'yicha chiziqli ekstrapolyatsiya, shuning uchun taxminiy. **Log** oynasi va **Logni saqlash** tugmasi.
+  ETA butun jarayon bo'yicha chiziqli ekstrapolyatsiya, shuning uchun taxminiy. Progress qatoridagi uzun xato matni `...` bilan
+  qisqartiriladi (to'liq matn — sichqonchani ustiga olib borganda va log/dialogda). Pastda **Log** va **Taxminiy hisob-kitob** (ikki sahifa;
+  dastagini tortib kattalashtirish/yig'ish mumkin) hamda **Logni saqlash/tozalash** tugmalari; o'qitish boshlanganda log paneli o'zi kattalashadi.
 * **Menyu:** *Fayl* (konfiguratsiyani saqlash/yuklash, chiqish), *Yordam* (dastur haqida, prospektivlik indeksi izohi).
 
 O'qitish boshlanishidan oldin sozlamalar tekshiriladi (kamida bitta model, k-fold >= 2, fon nuqtalar soni >= 5 va h.k.); muammo bo'lsa xabar chiqadi.
@@ -262,7 +270,7 @@ shu sabab "tugadi" signali kelsa ham Stop bosilgan bo'lishi mumkin.
 Har bir model uchun alohida sub-tab (Random Forest, SVM, XGBoost, CNN); parametrlar guruhlarga bo'lingan, har birining ustiga sichqoncha
 olib borilsa izoh, diapazon va standart qiymat ko'rinadi. Parametrlar to'liq ro'yxati va ma'nosi — 5-bo'lim.
 
-* **Standart qiymatlarga qaytarish (joriy model)** va **Hammasini standartga qaytarish**;
+* **Standartga qaytarish (joriy model)** va **Hammasini standartga qaytarish**;
 * **Preset saqlash/yuklash (JSON):** giperparametrlar va tuning sozlamalari faylga;
 * **Tuning** guruhi (5.4-bo'lim);
 * Hisoblash narxi bo'yicha izoh (sozlama o'zgarganda yangilanadi).
@@ -294,15 +302,19 @@ Pastda:
 * **metrikalar jadvali:** har model va ansambl uchun AUC (o'rtacha), AUC_std, 95% CI, PR-AUC, BalAcc, F1, Brier, Sens/Spec va Youden bo'sag'i (6.2-bo'lim);
   jadval ustida izoh: AUC va CI qanday hisoblangani, tuning bo'lsa baholash qanday o'tgani, CNN haqida eslatma;
 * ichki tablar: **ROC**, **PR**, **Kalibrlash**, **Chalkashlik matritsasi** (bu yerda *Model* tanlanadi; standart — ansambl);
-* tugmalar: **Jadvalni CSV/XLSX ga saqlash**, **Barcha grafiklarni saqlash (PNG+PDF)** (bu tabning grafiklari va boshqa tablarning grafiklari),
-  **Natijalarni eksport (CSV/JSON/XLSX)** (to'liq eksport, 11-bo'lim).
+* tugmalar (CV rejimi bilan bir qatorda): **Jadvalni saqlash** (CSV/XLSX), **Grafiklarni saqlash** (PNG+PDF) (bu tabning grafiklari va
+  boshqa tablarning grafiklari), **Eksport (CSV/JSON/XLSX)** (to'liq eksport, 11-bo'lim);
+* **CV takrorlari = 1** bo'lsa `AUC_std` ustuni bo'sh (std aniqlanmagan; 0.000 emas) va jadval ustida "1 takror: std aniqlanmagan" izohi chiqadi;
+  ishonchli std uchun takrorlar sonini 2 va undan ko'p qiling. Uzun izoh yig'iladigan "Izoh va eslatmalar" qatorida (bosib oching).
 
 Har grafikda matplotlib navigatsiya paneli bor: kattalashtirish (zoom), surish (pan), tiklash, rasmni saqlash.
 
 ### 4.5 Tab 5 — Spatial CV diagnostika
 
-Yuqorida umumiy grafik: random va spatial CV AUC yonma-yon (CI bilan), birinchi takrorning **fold xaritasi** (qaysi nuqta qaysi fold'da)
-va (yoqilgan bo'lsa) fon sezgirligi. Pastda ichki tablar:
+Ichki tablar (birinchisi — umumiy grafik):
+
+* **Diagnostika grafigi:** random va spatial CV AUC yonma-yon (CI bilan), birinchi takrorning **fold xaritasi** (qaysi nuqta qaysi
+  fold'da) va (yoqilgan bo'lsa) fon sezgirligi;
 
 * **Fold jadvali:** har fold'dagi train/validation nuqtalar, musbat nuqtalar, bloklar soni, har model uchun sekundlar (`seconds_<model>`);
   musbat nuqtasiz validation fold bo'lsa, ogohlantirish ko'rsatiladi;
@@ -313,7 +325,7 @@ va (yoqilgan bo'lsa) fon sezgirligi. Pastda ichki tablar:
 
 ### 4.6 Tab 6 — Feature importance
 
-Tepada **"Importance usuli: ..."** (permutation yoki MDI zaxirasi) va birliklar haqida izoh. Ichki tablar:
+Tepada **"Importance usuli: ..."** (permutation yoki MDI zaxirasi) va birliklar haqida yig'iladigan izoh (uni ochib o'qing). Ichki tablar:
 
 * **Importance (perm + SHAP):** permutation importance (dAUC, fold std xato chizig'i) va SHAP |o'rtacha| ustunli grafiklari, modellar yonma-yon;
 * **SHAP beeswarm** (*Model* tanlanadi) va **SHAP dependence** (*Model* va *Feature* tanlanadi; standart — eng muhim feature);
@@ -507,7 +519,7 @@ nuqtalarni butunlay train yoki validation'ga beradi — bu yangi, ko'rilmagan hu
 | Ustun | Ma'nosi | Qanday o'qiladi |
 |---|---|---|
 | **AUC** | ROC egri chizig'i ostidagi yuza, repeat'lar bo'yicha **o'rtacha** | 0.5 = tasodifiy, 1.0 = mukammal. Taxminiy qoida: 0.7-0.8 qoniqarli, 0.8-0.9 yaxshi; kichik namunada ehtiyot bo'ling |
-| **AUC_std** | AUC ning CV takrorlari orasidagi og'ishi | fold bo'linishiga bog'liqlik (kichik = barqaror). **Ishonch oralig'i emas** |
+| **AUC_std** | AUC ning CV takrorlari orasidagi og'ishi | fold bo'linishiga bog'liqlik (kichik = barqaror). **Ishonch oralig'i emas.** Takrorlar soni 1 bo'lsa std ma'nosiz: katak **bo'sh** (jadval/CSV/XLSX) yoki "-" (summary.txt), 0 emas |
 | **AUC_CI_lo / AUC_CI_hi** | 95% ishonch oralig'i: **blok-bootstrap** | nuqtalar emas, bloklar qayta tanlanadi (fazoviy bog'liqlikni hisobga oladi). Bu "nuqtalar to'plamining tasodifiyligi"ni ifodalaydi; kam musbat nuqtada keng |
 | **PR_AUC** | precision-recall egri chizig'i ostidagi yuza | musbatlar kam bo'lganda ma'lumotliroq; asosiy darajasi = musbat ulushi (sun'iy nisbat!) |
 | **BalAcc** | muvozanatli aniqlik, **0.5 bo'sag'ida** | sinflar o'rtacha to'g'ri topilish ulushi |
@@ -728,7 +740,9 @@ Eng yaxshi manba — **log oynasi** va **Spatial CV diagnostika** tabidagi ogohl
 | "...qatlami deyarli o'zgarmas" | qatlam konstanta | olib tashlang (hech narsa bermaydi) |
 | "...kategorik qatlam butun sonli emas" / "N ta daraja bor (maks. 30)" | uzluksiz qatlam kategorik deb belgilangan | kategorik belgisini olib tashlang |
 | "faqat X/N ta fon nuqta topildi" | min. masofa katta yoki valid maydon kichik | min. masofani kamaytiring yoki fon sonini kamaytiring |
-| "metadata.csv ';' ajratgich..." / "UTF-8 emas" | Excel boshqa format bilan saqlagan | "CSV UTF-8 (vergul bilan ajratilgan)" formatida qayta saqlang |
+| "metadata.csv o'qib bo'lmadi" / "'band_name' ustuni yo'q" | fayl matnli CSV emas (UTF-16/ikkilik), bo'sh yoki sarlavhada `band_name` yo'q | "CSV UTF-8" formatida qayta saqlang, birinchi qatorda `band_name` bo'lsin (`;` va cp1251 avtomatik taniladi, fayl o'zgarmaydi) |
+| "tuning rejimi 'final' (nested emas): CV metrikalari bazaviy giperparametrlar bilan..." | tuning `nested` emas | CV baholashi tuned model sifatini aks ettirmaydi; tuning ta'sirini baholash uchun `nested` rejimini tanlang |
+| "...moduli o'rnatilgan, lekin import qilib bo'lmadi (xato)" | kutubxona buzilgan yoki versiyalari mos emas | ko'rsatilgan xatoga qarab paketni qayta o'rnating (`pip install --force-reinstall ...`) yoki modelni o'chiring |
 | "XGBoost o'rnatilmagan" / "TensorFlow o'rnatilmagan" | ixtiyoriy kutubxona yo'q | `pip install xgboost` / `pip install tensorflow` (yoki `tensorflow-cpu`), yoki modelni o'chiring |
 | "kalibrlash o'tkazib yuborildi" | har sinfdan < 2 namuna (juda kam musbat nuqta) | kutilgan holat kam nuqtada; natija kalibrlanmagan ekanini hisobga oling |
 | "blok o'lchami CNN oynasidan kichik" | CNN patchlari train va validation orasida ustma-ust | blok o'lchamini kattalashtiring yoki `window` ni kichraytiring |
